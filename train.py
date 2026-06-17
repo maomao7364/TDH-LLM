@@ -313,6 +313,20 @@ def main():
         gpt2_path=args.gpt2_path,
     )
 
+    # --- 保存模型超参，方便 test.py 重建 ---
+    import json as _json
+    _model_args = dict(
+        input_dim=args.input_dim, hidden_dim=args.hidden_dim,
+        num_nodes=args.num_nodes, input_len=args.input_len,
+        output_len=args.output_len, gpt_layers=args.gpt_layers,
+        U=args.U, time_bins=time_bins, time_dim=args.time_dim,
+        gpt_dim=args.gpt_dim, trend_kernel=args.trend_kernel,
+        period_kernel=args.period_kernel, tcdg_layers=args.tcdg_layers,
+        dropout=args.dropout,
+    )
+    with open(os.path.join(save_path, 'model_args.json'), 'w') as _f:
+        _json.dump(_model_args, _f, indent=2)
+
     # --- 创建 Trainer ---
     engine = Trainer(model, scaler, args.lrate, args.wdecay, device,
                      epochs=args.epochs, use_amp=not args.no_amp)

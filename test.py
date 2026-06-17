@@ -28,6 +28,8 @@ from model.dest_llm import DeSTLLM
 parser = argparse.ArgumentParser(description='DeST-LLM test')
 parser.add_argument('--checkpoint', type=str, required=True,
                     help='训练好的模型权重路径 (best_model.pth)')
+parser.add_argument('--config', type=str, default=None,
+                    help='model_args.json 路径，自动覆盖模型超参（与 checkpoint 同目录下自动查找）')
 parser.add_argument('--device', type=str, default='cuda:0')
 parser.add_argument('--data', type=str, default='pems07_custom',
                     help='数据集名称 (data/ 下的目录)')
@@ -54,6 +56,23 @@ parser.add_argument('--period_kernel', type=int, default=7)
 parser.add_argument('--num_workers', type=int, default=0)
 
 args = parser.parse_args()
+
+# --- 从 model_args.json 读取模型超参（自动或手动指定） ---
+import json as _json
+
+_config_path = args.config
+if _config_path is None:
+    _auto_config = os.path.join(os.path.dirname(args.checkpoint), 'model_args.json')
+    if os.path.exists(_auto_config):
+        _config_path = _auto_config
+        print(f'Auto-detected config: {_config_path}')
+
+if _config_path and os.path.exists(_config_path):
+    with open(_config_path) as _f:
+        _cfg = _json.load(_f)
+    for _k, _v in _cfg.items():
+        setattr(args, _k, _v)
+    print(f'Loaded model config: {_config_path}')
 
 
 def main():
@@ -99,7 +118,7 @@ def main():
     print(f'Adj shape: {adj.shape}')
 
     # --- 重建模型并加载权重 ---
-    time_bins = 288  # PeMS 5-min sampling
+    time_bins = getattr(args, 'time_bins', 288)  # from config or default PeMS 5-min
     model = DeSTLLM(
         adj=adj,
         input_dim=args.input_dim,
