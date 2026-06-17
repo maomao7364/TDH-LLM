@@ -101,9 +101,9 @@ def run_inference():
                              '607a30d783dfa663caf39e06633721c8d4cfcd7e')
     model = DeSTLLM(
         adj=adj, input_dim=3, hidden_dim=256, num_nodes=50,
-        input_len=24, output_len=24, gpt_layers=4, U=2,
-        time_bins=288, time_dim=128, gpt_dim=768,
-        tcdg_layers=2, dropout=0.15, trend_kernel=5, period_kernel=7,
+        input_len=24, output_len=24, gpt_layers=4, U=1,
+        time_bins=288, time_dim=32, gpt_dim=768,
+        tcdg_layers=2, dropout=0.20, trend_kernel=5, period_kernel=7,
         gpt2_path=gpt2_path,
     ).to(device)
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))

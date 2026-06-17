@@ -43,21 +43,21 @@ parser.add_argument('--gpt2_path', type=str, default=None,
 
 # 模型结构
 parser.add_argument('--hidden_dim', type=int, default=256, help='MTD / TCDG 隐层维度')
-parser.add_argument('--time_dim', type=int, default=128, help='时间嵌入维度')
+parser.add_argument('--time_dim', type=int, default=32, help='时间嵌入维度')
 parser.add_argument('--gpt_dim', type=int, default=768, help='GPT-2 隐层维度')
 parser.add_argument('--gpt_layers', type=int, default=4, help='使用的 GPT-2 层数')
-parser.add_argument('--U', type=int, default=2, help='PFA 中顶部解冻的 attention 层数')
+parser.add_argument('--U', type=int, default=1, help='PFA 中顶部解冻的 attention 层数')
 parser.add_argument('--tcdg_layers', type=int, default=2, help='TCDG 堆叠层数')
-parser.add_argument('--dropout', type=float, default=0.15, help='Dropout 比例')
+parser.add_argument('--dropout', type=float, default=0.20, help='Dropout 比例')
 parser.add_argument('--trend_kernel', type=int, default=5, help='MTD 趋势分解卷积核大小')
 parser.add_argument('--period_kernel', type=int, default=7, help='MTD 周期分解卷积核大小')
 
 # 训练
-parser.add_argument('--lrate', type=float, default=5e-4, help='学习率')
-parser.add_argument('--wdecay', type=float, default=1e-4, help='权重衰减')
+parser.add_argument('--lrate', type=float, default=4e-4, help='学习率')
+parser.add_argument('--wdecay', type=float, default=2e-4, help='权重衰减')
 parser.add_argument('--epochs', type=int, default=300, help='最大训练轮数')
 
-parser.add_argument('--es_patience', type=int, default=100,
+parser.add_argument('--es_patience', type=int, default=50,
                     help='早停耐心值：超过该轮数无改善则停止')
 parser.add_argument('--test_every', type=int, default=20,
                     help='每 N 轮在测试集上评估一次 (0=仅在 best 时测试)')
@@ -82,10 +82,12 @@ def get_time_bins(num_nodes, data_name):
 # ---------------------------------------------------------------------------
 class Trainer:
     def __init__(self, model, scaler, lrate, wdecay, device, epochs=300,
-                 warmup_epochs=10, clip=5, use_amp=True):
+                 warmup_epochs=10, clip=5, use_amp=True,
+                 long_weight=0.2, long_start=17):
         self.model = model.to(device)
-        self.loss_fn = MAE_torch
         self.data_scaler = scaler
+        self.long_weight = long_weight
+        self.long_start = long_start
         self.clip = clip
         self.use_amp = use_amp
         self.amp_scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
@@ -100,7 +102,7 @@ class Trainer:
             else:
                 other_params.append(p)
 
-        gpt_lr = min(lrate * 0.1, 5e-5)
+        gpt_lr = min(lrate * 0.1, 1e-5)
         self.optimizer = Ranger([
             {'params': other_params, 'lr': lrate, 'weight_decay': wdecay},
             {'params': gpt_params, 'lr': gpt_lr, 'weight_decay': wdecay},
@@ -120,7 +122,15 @@ class Trainer:
         print(f'Param count: {model.param_num():,}')
         print(f'AMP: {use_amp}')
         print(f'LR schedule: warmup {warmup_epochs} epochs → cosine to epoch {epochs}')
+        print(f'Loss: MAE_all + {long_weight} * MAE_horizon_{long_start}:{model.output_len}')
         print(model)
+
+    def compute_loss(self, predict, real):
+        """MAE_all + long_weight * MAE on late horizons (90-120 min)."""
+        mae_all = MAE_torch(predict, real, 0.0)
+        mae_long = MAE_torch(predict[..., self.long_start:],
+                             real[..., self.long_start:], 0.0)
+        return mae_all + self.long_weight * mae_long
 
     def train_step(self, input_, real_val):
         """单步训练：AMP 前向 + 反向 + 梯度裁剪 + 优化器更新"""
@@ -132,7 +142,7 @@ class Trainer:
             output = output.transpose(1, 3)                          # -> [B, 1, N, out_len]
             real = torch.unsqueeze(real_val, dim=1)                  # -> [B, 1, N, out_len]
             predict = self.data_scaler.inverse_transform(output)     # 反归一化后再算指标
-            loss = self.loss_fn(predict, real, 0.0)
+            loss = self.compute_loss(predict, real)
 
         if self.use_amp:
             self.amp_scaler.scale(loss).backward()
@@ -162,7 +172,7 @@ class Trainer:
             output = output.transpose(1, 3)
             real = torch.unsqueeze(real_val, dim=1)
             predict = self.data_scaler.inverse_transform(output)
-            loss = self.loss_fn(predict, real, 0.0)
+            loss = self.compute_loss(predict, real)
         mape = MAPE_torch(predict, real, 0.0).item()
         rmse = RMSE_torch(predict, real, 0.0).item()
         wmape = WMAPE_torch(predict, real, 0.0).item()
