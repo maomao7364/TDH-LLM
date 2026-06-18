@@ -62,7 +62,9 @@ import json as _json
 
 _config_path = args.config
 if _config_path is None:
-    _auto_config = os.path.join(os.path.dirname(args.checkpoint), 'model_args.json')
+    _ckpt_dir = (args.checkpoint if os.path.isdir(args.checkpoint)
+                 else os.path.dirname(args.checkpoint))
+    _auto_config = os.path.join(_ckpt_dir, 'model_args.json')
     if os.path.exists(_auto_config):
         _config_path = _auto_config
         print(f'Auto-detected config: {_config_path}')

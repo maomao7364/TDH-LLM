@@ -82,12 +82,10 @@ def get_time_bins(num_nodes, data_name):
 # ---------------------------------------------------------------------------
 class Trainer:
     def __init__(self, model, scaler, lrate, wdecay, device, epochs=300,
-                 warmup_epochs=10, clip=5, use_amp=True,
-                 long_weight=0.2, long_start=17):
+                 warmup_epochs=10, clip=5, use_amp=True):
         self.model = model.to(device)
+        self.loss_fn = MAE_torch
         self.data_scaler = scaler
-        self.long_weight = long_weight
-        self.long_start = long_start
         self.clip = clip
         self.use_amp = use_amp
         self.amp_scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
@@ -122,15 +120,7 @@ class Trainer:
         print(f'Param count: {model.param_num():,}')
         print(f'AMP: {use_amp}')
         print(f'LR schedule: warmup {warmup_epochs} epochs → cosine to epoch {epochs}')
-        print(f'Loss: MAE_all + {long_weight} * MAE_horizon_{long_start}:{model.output_len}')
         print(model)
-
-    def compute_loss(self, predict, real):
-        """MAE_all + long_weight * MAE on late horizons (90-120 min)."""
-        mae_all = MAE_torch(predict, real, 0.0)
-        mae_long = MAE_torch(predict[..., self.long_start:],
-                             real[..., self.long_start:], 0.0)
-        return mae_all + self.long_weight * mae_long
 
     def train_step(self, input_, real_val):
         """单步训练：AMP 前向 + 反向 + 梯度裁剪 + 优化器更新"""
@@ -142,7 +132,7 @@ class Trainer:
             output = output.transpose(1, 3)                          # -> [B, 1, N, out_len]
             real = torch.unsqueeze(real_val, dim=1)                  # -> [B, 1, N, out_len]
             predict = self.data_scaler.inverse_transform(output)     # 反归一化后再算指标
-            loss = self.compute_loss(predict, real)
+            loss = self.loss_fn(predict, real, 0.0)
 
         if self.use_amp:
             self.amp_scaler.scale(loss).backward()
@@ -172,7 +162,7 @@ class Trainer:
             output = output.transpose(1, 3)
             real = torch.unsqueeze(real_val, dim=1)
             predict = self.data_scaler.inverse_transform(output)
-            loss = self.compute_loss(predict, real)
+            loss = self.loss_fn(predict, real, 0.0)
         mape = MAPE_torch(predict, real, 0.0).item()
         rmse = RMSE_torch(predict, real, 0.0).item()
         wmape = WMAPE_torch(predict, real, 0.0).item()
@@ -324,8 +314,6 @@ def main():
         period_kernel=args.period_kernel, tcdg_layers=args.tcdg_layers,
         dropout=args.dropout,
     )
-    with open(os.path.join(save_path, 'model_args.json'), 'w') as _f:
-        _json.dump(_model_args, _f, indent=2)
 
     # --- 创建 Trainer ---
     engine = Trainer(model, scaler, args.lrate, args.wdecay, device,
@@ -342,6 +330,9 @@ def main():
                                  time.strftime('%Y-%m-%d-%H-%M-%S') + '-' + data_name) + '/'
     save_path = args.save
     os.makedirs(save_path, exist_ok=True)
+
+    with open(os.path.join(save_path, 'model_args.json'), 'w') as _f:
+        _json.dump(_model_args, _f, indent=2)
 
     # --- 训练状态变量 ---
     loss_best = float('inf')
