@@ -10,9 +10,9 @@ class HorizonAwareDecoder(nn.Module):
       - e_{t+h}^{tod}: future time-of-day embedding
       - e_{t+h}^{dow}: future day-of-week embedding
 
-    y_{t+h,i} = f(z_i, e_h, e_{t+h}^{tod}, e_{t+h}^{dow})
+    y_{t+h,i} = f(z_i, e_h, e_{t+h}^{tod}, e_{t+h}^{dow}, d_{t+h})
 
-    Replaces the original Conv2d(gpt_dim, output_len, 1) single-shot regression.
+    where d_{t+h} is the normalised daily reference flow at the target horizon.
     """
 
     def __init__(self, gpt_dim, output_len, time_bins=288, time_dim=64,
@@ -33,8 +33,8 @@ class HorizonAwareDecoder(nn.Module):
         self.dow_emb = nn.Parameter(torch.empty(7, time_dim))
         nn.init.xavier_uniform_(self.dow_emb)
 
-        # Fusion MLP: f(z_i, e_h, e_tod, e_dow) -> scalar flow
-        fusion_in = gpt_dim + horizon_dim + time_dim * 2
+        # Fusion MLP: f(z_i, e_h, e_tod, e_dow, d_{t+h}) -> scalar flow
+        fusion_in = gpt_dim + horizon_dim + time_dim * 2 + 1
         self.fusion = nn.Sequential(
             nn.LayerNorm(fusion_in),
             nn.Linear(fusion_in, 256),
@@ -43,12 +43,13 @@ class HorizonAwareDecoder(nn.Module):
             nn.Linear(256, 1),
         )
 
-    def forward(self, z, last_tod, last_dow):
+    def forward(self, z, last_tod, last_dow, future_daily=None):
         """
         Args:
-            z:        [B, N, gpt_dim]  GPT-2 output per node
-            last_tod: [B, N]           tod at last input step, normalised [0, 1)
-            last_dow: [B, N]           dow at last input step, normalised [0, 1)
+            z:            [B, N, gpt_dim]  GPT-2 output per node
+            last_tod:     [B, N]           tod at last input step, normalised [0, 1)
+            last_dow:     [B, N]           dow at last input step, normalised [0, 1)
+            future_daily: [B, N, H] or None  normalised daily ref at each horizon
         Returns:
             [B, output_len, N, 1]
         """
@@ -75,8 +76,14 @@ class HorizonAwareDecoder(nn.Module):
         # Expand node representations over horizon dimension
         z_exp = z.unsqueeze(1).expand(B, H, N, D)                                     # [B, H, N, gpt_dim]
 
+        # Future daily reference: [B, N, H] -> [B, H, N, 1]
+        if future_daily is not None:
+            fd = future_daily.permute(0, 2, 1).unsqueeze(-1)
+        else:
+            fd = torch.zeros(B, H, N, 1, device=z.device)
+
         # Concatenate all conditions and fuse
-        feat = torch.cat([z_exp, e_h, e_tod, e_dow], dim=-1)                         # [B, H, N, fusion_in]
+        feat = torch.cat([z_exp, e_h, e_tod, e_dow, fd], dim=-1)                     # [B, H, N, fusion_in]
         out = self.fusion(feat)                                                        # [B, H, N, 1]
 
         return out

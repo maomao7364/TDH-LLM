@@ -17,7 +17,8 @@ if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
 from util import load_dataset, metric, MAE_torch, MAPE_torch, RMSE_torch, WMAPE_torch
-from util import load_adj_from_pkl, load_adj_from_npy, build_correlation_adj
+from util import load_adj_from_pkl, load_adj_from_npy, build_correlation_adj, topk_adj
+from dataset_checks import validate_dataset_shapes
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from ranger21 import Ranger
 
@@ -32,7 +33,9 @@ parser = argparse.ArgumentParser(description='DeST-LLM training')
 parser.add_argument('--device', type=str, default='cuda:0')
 parser.add_argument('--data', type=str, default='pems07_custom', help='data/ 下的数据集目录名')
 parser.add_argument('--adj', type=str, default=None, help='邻接矩阵路径 (.npy 或 .pkl)')
-parser.add_argument('--input_dim', type=int, default=3, help='输入特征维度')
+parser.add_argument('--topk', type=int, default=0,
+                    help='邻接矩阵 top-k 稀疏化 (0=不稀疏)')
+parser.add_argument('--input_dim', type=int, default=4, help='输入特征维度')
 parser.add_argument('--num_nodes', type=int, default=50, help='路网节点数')
 parser.add_argument('--input_len', type=int, default=24, help='输入时间步长 (24=2h)')
 parser.add_argument('--output_len', type=int, default=24, help='预测时间步长 (24=120min)')
@@ -121,13 +124,13 @@ class Trainer:
         print(f'LR schedule: warmup {warmup_epochs} epochs → cosine to epoch {epochs}')
         print(model)
 
-    def train_step(self, input_, real_val):
+    def train_step(self, input_, real_val, future_daily=None):
         """单步训练：AMP 前向 + 反向 + 梯度裁剪 + 优化器更新"""
         self.model.train()
         self.optimizer.zero_grad()
 
         with torch.amp.autocast('cuda', enabled=self.use_amp):
-            output = self.model(input_)
+            output = self.model(input_, future_daily=future_daily)
             output = output.transpose(1, 3)                          # -> [B, 1, N, out_len]
             real = torch.unsqueeze(real_val, dim=1)                  # -> [B, 1, N, out_len]
             predict = self.data_scaler.inverse_transform(output)     # 反归一化后再算指标
@@ -153,11 +156,11 @@ class Trainer:
         return loss.item(), mape, rmse, wmape
 
     @torch.no_grad()
-    def eval_step(self, input_, real_val):
+    def eval_step(self, input_, real_val, future_daily=None):
         """单步评估（不计算梯度）"""
         self.model.eval()
         with torch.amp.autocast('cuda', enabled=self.use_amp):
-            output = self.model(input_)
+            output = self.model(input_, future_daily=future_daily)
             output = output.transpose(1, 3)
             real = torch.unsqueeze(real_val, dim=1)
             predict = self.data_scaler.inverse_transform(output)
@@ -191,11 +194,14 @@ def run_test_eval(model, dataloader, scaler, device, output_len, use_amp, title=
     real_y = real_y.transpose(1, 3)[:, 0, :, :]
 
     preds = []
-    for x, _ in dataloader['test_loader']:
+    for x, y in dataloader['test_loader']:
         test_x = x.float().to(device, non_blocking=True)
         test_x = test_x.transpose(1, 3)
+        test_y = y.float().to(device, non_blocking=True)
+        test_y = test_y.transpose(1, 3)                    # [B, C_y, N, H]
+        test_fd = test_y[:, 1, :, :] if test_y.size(1) > 1 else None
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=use_amp):
-            out = model(test_x).transpose(1, 3).squeeze(1)
+            out = model(test_x, future_daily=test_fd).transpose(1, 3).squeeze(1)
         preds.append(out)
 
     y_hat = torch.cat(preds, dim=0)
@@ -235,7 +241,7 @@ def run_test_eval(model, dataloader, scaler, device, output_len, use_amp, title=
 # 主训练流程
 # ---------------------------------------------------------------------------
 def main():
-    seed_it(2024)
+    seed_it(6666)
 
     # --- 解析数据集路径 ---
     data_name = args.data
@@ -256,6 +262,16 @@ def main():
     # --- 加载数据（train/val/test + scaler） ---
     dataloader = load_dataset(data_dir, args.batch_size, args.batch_size, args.batch_size,
                               num_workers=args.num_workers)
+    shape_info = validate_dataset_shapes(
+        dataloader,
+        input_len=args.input_len,
+        output_len=args.output_len,
+        input_dim=args.input_dim,
+        num_nodes=args.num_nodes,
+    )
+    print(f'Data shape: input_len={shape_info["input_len"]}, '
+          f'output_len={shape_info["output_len"]}, '
+          f'nodes={shape_info["num_nodes"]}, input_dim={shape_info["input_dim"]}')
     scaler = dataloader['scaler']
 
     # --- 构建 / 加载邻接矩阵 ---
@@ -281,6 +297,11 @@ def main():
             print('No --adj provided, building correlation adjacency from training data ...')
             adj = build_correlation_adj(dataloader['x_train'])
             print(f'Built correlation adjacency, shape={adj.shape}')
+
+    if args.topk > 0:
+        adj = topk_adj(adj, args.topk)
+        nz = (adj > 0).sum()
+        print(f'Top-{args.topk} adjacency: {nz} non-zero edges ({nz / (adj.shape[0] ** 2) * 100:.1f}%)')
 
     # --- 初始化模型 ---
     model = DeSTLLM(
@@ -355,10 +376,11 @@ def main():
         for x, y in dataloader['train_loader']:
             train_x = x.float().to(device, non_blocking=True)   # [B, T, N, C]
             train_x = train_x.transpose(1, 3)                   # [B, C, N, T]
-            train_y = y.float().to(device, non_blocking=True)   # [B, T, N, C]
-            train_y = train_y.transpose(1, 3)                   # [B, C, N, T]
-            # train_y[:, 0, :, :] 取第一个特征（流量）作为回归目标
-            loss, mape, rmse, wmape = engine.train_step(train_x, train_y[:, 0, :, :])
+            train_y = y.float().to(device, non_blocking=True)   # [B, H, N, C_y]
+            train_y = train_y.transpose(1, 3)                   # [B, C_y, N, H]
+            train_fd = train_y[:, 1, :, :] if train_y.size(1) > 1 else None
+            loss, mape, rmse, wmape = engine.train_step(
+                train_x, train_y[:, 0, :, :], future_daily=train_fd)
             train_losses.append(loss)
             train_mapes.append(mape)
             train_rmses.append(rmse)
@@ -374,7 +396,9 @@ def main():
             val_x = val_x.transpose(1, 3)
             val_y = y.float().to(device, non_blocking=True)
             val_y = val_y.transpose(1, 3)
-            loss, mape, rmse, wmape = engine.eval_step(val_x, val_y[:, 0, :, :])
+            val_fd = val_y[:, 1, :, :] if val_y.size(1) > 1 else None
+            loss, mape, rmse, wmape = engine.eval_step(
+                val_x, val_y[:, 0, :, :], future_daily=val_fd)
             valid_losses.append(loss)
             valid_mapes.append(mape)
             valid_rmses.append(rmse)

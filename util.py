@@ -56,6 +56,14 @@ def load_dataset(dataset_dir, batch_size, valid_batch_size=None, test_batch_size
     for category in ['train', 'val', 'test']:
         data['x_' + category][..., 0] = scaler.transform(
             data['x_' + category][..., 0])
+        # daily_flow (channel 3) shares the same distribution as flow
+        if data['x_' + category].shape[-1] >= 4:
+            data['x_' + category][..., 3] = scaler.transform(
+                data['x_' + category][..., 3])
+        # y channel 1 = future_daily reference, same distribution
+        if data['y_' + category].shape[-1] >= 2:
+            data['y_' + category][..., 1] = scaler.transform(
+                data['y_' + category][..., 1])
 
     # Note: PyTorch DataLoader handles shuffling each epoch via shuffle=True,
     # so we don't manually permute the arrays here.
@@ -149,6 +157,24 @@ def _densify(m):
     if sp.issparse(m):
         return m.toarray().astype(np.float32)
     return np.array(m, dtype=np.float32)
+
+
+def topk_adj(adj, k):
+    """Keep top-k strongest neighbours per node, symmetrise, re-normalise."""
+    N = adj.shape[0]
+    k = min(k, N - 1)
+    mask = np.zeros_like(adj)
+    for i in range(N):
+        row = adj[i].copy()
+        row[i] = -np.inf
+        topk_idx = np.argpartition(row, -k)[-k:]
+        mask[i, topk_idx] = 1.0
+    mask = np.maximum(mask, mask.T)
+    adj = adj * mask
+    d = np.sum(adj, axis=1)
+    d = np.where(d > 0, 1.0 / np.sqrt(d), 0)
+    adj = d[:, None] * adj * d[None, :]
+    return adj.astype(np.float32)
 
 
 def build_correlation_adj(data, threshold=0.5):

@@ -16,8 +16,8 @@ import sys
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-INPUT_LEN = 12
-OUTPUT_LEN = 12
+INPUT_LEN = 24
+OUTPUT_LEN = 24
 # Standard PeMS04 split ratios
 TRAIN_RATIO = 0.6
 VAL_RATIO = 0.2
@@ -60,13 +60,15 @@ def build_adjacency_from_csv(csv_path, num_nodes):
 def sliding_window(data, input_len, output_len):
     """
     data: (T, N, C)
-    returns: x (S, input_len, N, C), y (S, output_len, N, 1) — flow channel only, kept 4D
+    returns: x (S, input_len, N, C), y (S, output_len, N, 2) — flow + future_daily
     """
     T = data.shape[0]
     x_list, y_list = [], []
     for t in range(0, T - input_len - output_len + 1):
         x_list.append(data[t:t + input_len])               # [input_len, N, C]
-        y_list.append(data[t + input_len:t + input_len + output_len, :, 0:1])  # [output_len, N, 1]
+        y_flow = data[t + input_len:t + input_len + output_len, :, 0:1]   # [H, N, 1]
+        y_daily = data[t + input_len:t + input_len + output_len, :, 3:4]   # [H, N, 1]
+        y_list.append(np.concatenate([y_flow, y_daily], axis=-1))
     return np.stack(x_list, axis=0), np.stack(y_list, axis=0)
 
 
@@ -87,13 +89,19 @@ def main():
         tod[t, :, 0] = minute_of_day
         dow[t, :, 0] = day_of_week
 
-    # Stack: [flow, time_of_day, day_of_week]
-    data = np.concatenate([flow, tod, dow], axis=-1).astype(np.float32)  # (T, N, 3)
-    print(f'Feature shape: {data.shape}  (channels: flow, tod, dow)')
+    # Daily reference: flow[t - 288]
+    daily = np.zeros_like(flow)
+    daily[STEPS_PER_DAY:] = flow[:-STEPS_PER_DAY]
+
+    # Stack: [flow, time_of_day, day_of_week, daily_flow]
+    data = np.concatenate([flow, tod, dow, daily], axis=-1).astype(np.float32)  # (T, N, 4)
+    data = data[STEPS_PER_DAY:]  # drop first day (no valid daily reference)
+    T_new = data.shape[0]
+    print(f'Feature shape: {data.shape}  (channels: flow, tod, dow, daily_flow)')
 
     # ---- chronological splits ----
-    train_end = int(T * TRAIN_RATIO)
-    val_end = int(T * (TRAIN_RATIO + VAL_RATIO))
+    train_end = int(T_new * TRAIN_RATIO)
+    val_end = int(T_new * (TRAIN_RATIO + VAL_RATIO))
 
     data_train = data[:train_end]
     data_val = data[train_end - INPUT_LEN:val_end]   # slight overlap for continuity

@@ -18,7 +18,8 @@ if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
 from util import load_dataset, metric
-from util import load_adj_from_pkl, load_adj_from_npy, build_correlation_adj
+from util import load_adj_from_pkl, load_adj_from_npy, build_correlation_adj, topk_adj
+from dataset_checks import validate_dataset_shapes
 from model.dest_llm import DeSTLLM
 
 
@@ -35,7 +36,9 @@ parser.add_argument('--data', type=str, default='pems07_custom',
                     help='数据集名称 (data/ 下的目录)')
 parser.add_argument('--adj', type=str, default=None,
                     help='邻接矩阵路径，默认自动查找')
-parser.add_argument('--input_dim', type=int, default=3)
+parser.add_argument('--topk', type=int, default=0,
+                    help='邻接矩阵 top-k 稀疏化 (0=不稀疏)')
+parser.add_argument('--input_dim', type=int, default=4)
 parser.add_argument('--num_nodes', type=int, default=50,
                     help='路网节点数')
 parser.add_argument('--input_len', type=int, default=24, help='输入时间步长 (24=2h)')
@@ -61,6 +64,7 @@ args = parser.parse_args()
 import json as _json
 
 _config_path = args.config
+_config_has_decoder_key = False
 if _config_path is None:
     _ckpt_dir = (args.checkpoint if os.path.isdir(args.checkpoint)
                  else os.path.dirname(args.checkpoint))
@@ -72,12 +76,33 @@ if _config_path is None:
 if _config_path and os.path.exists(_config_path):
     with open(_config_path) as _f:
         _cfg = _json.load(_f)
+    _config_has_decoder_key = 'use_horizon_decoder' in _cfg
     for _k, _v in _cfg.items():
         setattr(args, _k, _v)
-    # Legacy checkpoints without use_horizon_decoder key use Conv2d regression
-    if 'use_horizon_decoder' not in _cfg:
-        args.use_horizon_decoder = False
     print(f'Loaded model config: {_config_path}')
+
+
+def build_model(adj, device, use_horizon_decoder):
+    time_bins = getattr(args, 'time_bins', 288)
+    return DeSTLLM(
+        adj=adj,
+        input_dim=args.input_dim,
+        hidden_dim=args.hidden_dim,
+        num_nodes=args.num_nodes,
+        input_len=args.input_len,
+        output_len=args.output_len,
+        gpt_layers=args.gpt_layers,
+        U=args.U,
+        time_bins=time_bins,
+        time_dim=args.time_dim,
+        gpt_dim=args.gpt_dim,
+        trend_kernel=args.trend_kernel,
+        period_kernel=args.period_kernel,
+        tcdg_layers=args.tcdg_layers,
+        dropout=args.dropout,
+        use_horizon_decoder=use_horizon_decoder,
+        gpt2_path=args.gpt2_path,
+    ).to(device)
 
 
 def main():
@@ -104,6 +129,16 @@ def main():
     # --- 加载数据 ---
     dataloader = load_dataset(data_dir, args.batch_size, args.batch_size, args.batch_size,
                               num_workers=args.num_workers)
+    shape_info = validate_dataset_shapes(
+        dataloader,
+        input_len=args.input_len,
+        output_len=args.output_len,
+        input_dim=args.input_dim,
+        num_nodes=args.num_nodes,
+    )
+    print(f'Data shape: input_len={shape_info["input_len"]}, '
+          f'output_len={shape_info["output_len"]}, '
+          f'nodes={shape_info["num_nodes"]}, input_dim={shape_info["input_dim"]}')
     scaler = dataloader['scaler']
 
     # --- 邻接矩阵 ---
@@ -122,30 +157,25 @@ def main():
                 adj = build_correlation_adj(dataloader['x_train'])
     print(f'Adj shape: {adj.shape}')
 
-    # --- 重建模型并加载权重 ---
-    time_bins = getattr(args, 'time_bins', 288)  # from config or default PeMS 5-min
-    model = DeSTLLM(
-        adj=adj,
-        input_dim=args.input_dim,
-        hidden_dim=args.hidden_dim,
-        num_nodes=args.num_nodes,
-        input_len=args.input_len,
-        output_len=args.output_len,
-        gpt_layers=args.gpt_layers,
-        U=args.U,
-        time_bins=time_bins,
-        time_dim=args.time_dim,
-        gpt_dim=args.gpt_dim,
-        trend_kernel=args.trend_kernel,
-        period_kernel=args.period_kernel,
-        tcdg_layers=args.tcdg_layers,
-        dropout=args.dropout,
-        use_horizon_decoder=getattr(args, 'use_horizon_decoder', False),
-        gpt2_path=args.gpt2_path,
-    ).to(device)
+    if args.topk > 0:
+        adj = topk_adj(adj, args.topk)
+        nz = (adj > 0).sum()
+        print(f'Top-{args.topk} adjacency: {nz} non-zero edges ({nz / (adj.shape[0] ** 2) * 100:.1f}%)')
 
+    # --- 重建模型并加载权重 ---
     ckpt = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(ckpt)
+    use_horizon_decoder = getattr(args, 'use_horizon_decoder', True)
+    model = build_model(adj, device, use_horizon_decoder)
+    try:
+        model.load_state_dict(ckpt)
+    except RuntimeError:
+        if _config_has_decoder_key:
+            raise
+        print('Checkpoint did not match HorizonAwareDecoder; retrying legacy Conv2d head.')
+        model = build_model(adj, device, False)
+        model.load_state_dict(ckpt)
+    if args.topk > 0:
+        model.adj.copy_(torch.tensor(adj, dtype=torch.float32, device=device))
     model.eval()
     print(f'Checkpoint loaded: {args.checkpoint}')
     print(f'Params: {sum(p.numel() for p in model.parameters()):,}')
@@ -156,10 +186,13 @@ def main():
 
     preds = []
     with torch.no_grad(), torch.amp.autocast('cuda'):
-        for x, _ in dataloader['test_loader']:
+        for x, y in dataloader['test_loader']:
             test_x = x.float().to(device, non_blocking=True)
             test_x = test_x.transpose(1, 3)                     # [B, C, N, T]
-            out = model(test_x).transpose(1, 3)                 # [B, 1, N, out_len]
+            test_y = y.float().to(device, non_blocking=True)
+            test_y = test_y.transpose(1, 3)                     # [B, C_y, N, H]
+            test_fd = test_y[:, 1, :, :] if test_y.size(1) > 1 else None
+            out = model(test_x, future_daily=test_fd).transpose(1, 3)  # [B, 1, N, out_len]
             preds.append(out.squeeze(1))
 
     y_hat = torch.cat(preds, dim=0)                            # [samples, N, out_len]

@@ -12,7 +12,7 @@ Output (data/pems07_custom/):
 
 Usage:
     python preprocess_custom.py
-    python preprocess_custom.py --input-len 12 --output-len 24
+    python preprocess_custom.py --input-len 24 --output-len 24
 """
 
 import numpy as np
@@ -59,13 +59,15 @@ def sliding_window(data, input_len, output_len):
     window = input_len + output_len
     for t in range(0, data.shape[0] - window + 1):
         xs.append(data[t:t + input_len])
-        ys.append(data[t + input_len:t + window, :, 0:1])
+        y_flow = data[t + input_len:t + window, :, 0:1]   # [H, N, 1]
+        y_daily = data[t + input_len:t + window, :, 3:4]   # [H, N, 1] future daily ref
+        ys.append(np.concatenate([y_flow, y_daily], axis=-1))
     return np.stack(xs, axis=0), np.stack(ys, axis=0)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Preprocess custom PeMS07 50-node data')
-    parser.add_argument('--input-len', type=int, default=12)
+    parser.add_argument('--input-len', type=int, default=24)
     parser.add_argument('--output-len', type=int, default=24)
     args = parser.parse_args()
 
@@ -104,12 +106,18 @@ def main():
         tod[t, :, 0] = (t % STEPS_PER_DAY) / STEPS_PER_DAY
         dow[t, :, 0] = ((t // STEPS_PER_DAY) % 7) / 7.0
 
-    data = np.concatenate([flow_3d, tod, dow], axis=-1).astype(np.float32)
-    print(f'Features: {data.shape}  (flow, tod, dow)')
+    # Daily reference: flow[t - 288]
+    daily = np.zeros_like(flow_3d)
+    daily[STEPS_PER_DAY:] = flow_3d[:-STEPS_PER_DAY]
+
+    data = np.concatenate([flow_3d, tod, dow, daily], axis=-1).astype(np.float32)
+    data = data[STEPS_PER_DAY:]  # drop first day (no valid daily reference)
+    T_new = data.shape[0]
+    print(f'Features: {data.shape}  (flow, tod, dow, daily_flow)  [{T_new} steps, first day dropped]')
 
     # --- Chronological splits ---
-    train_end = int(T * TRAIN_RATIO)
-    val_end = int(T * (TRAIN_RATIO + VAL_RATIO))
+    train_end = int(T_new * TRAIN_RATIO)
+    val_end = int(T_new * (TRAIN_RATIO + VAL_RATIO))
     data_train = data[:train_end]
     data_val = data[train_end - input_len:val_end]
     data_test = data[val_end - input_len:]

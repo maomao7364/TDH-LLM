@@ -15,12 +15,13 @@ class DeSTLLM(nn.Module):
     Pipeline:
       1. Flow projection with local temporal context + time-feature injection
       2. MTD:  decompose into trend / periodic / residual
-      3. Static GCN:  spatial smoothing per component (no noisy gate)
+      3. Static GCN:  spatial smoothing per component
       4. Temporal pooling via learned attention
-      5. GMSF:  time-conditioned gate-based fusion of the three components
-      6. Node embedding:  explicit per-node identity token
-      7. PFA:  GPT-2 models cross-node dependencies
-      8. HorizonAwareDecoder: per-step conditioned prediction
+      5. Daily reference branch: daily_proj → pool → periodic gate enhancement
+      6. GMSF:  time-conditioned gate-based fusion
+      7. Node embedding:  explicit per-node identity token
+      8. PFA:  GPT-2 models cross-node dependencies
+      9. HorizonAwareDecoder: per-step conditioned prediction
     """
 
     def __init__(
@@ -59,13 +60,21 @@ class DeSTLLM(nn.Module):
         self.input_proj = nn.Conv2d(1, hidden_dim, kernel_size=(1, 3),
                                     padding=(0, 1), bias=False)
 
-        # 1b. Time-feature injection:  tod/dow projected to same dim
-        #     and added to flow features so time context flows through
-        #     the entire decomposition + GCN pipeline, not just gating.
+        # 1b. Time-feature injection: tod/dow always channels 1,2
         self.has_time_features = input_dim >= 3
-        aux_input_dim = max(input_dim - 1, 1)
-        self.time_input_proj = nn.Conv2d(aux_input_dim, hidden_dim, kernel_size=1,
-                                         bias=False)
+        self.has_daily = input_dim >= 4
+        self.time_input_proj = nn.Conv2d(2, hidden_dim, kernel_size=1, bias=False)
+
+        # 1c. Daily reference branch (no GCN): daily flow → projection → pool
+        if self.has_daily:
+            self.daily_proj = nn.Conv2d(1, hidden_dim, kernel_size=(1, 3),
+                                         padding=(0, 1), bias=False)
+            gate_in = hidden_dim * 2 + time_dim  # periodic_p + daily_p + t_embed
+            self.periodic_gate = nn.Sequential(
+                nn.Linear(gate_in, hidden_dim),
+                nn.Sigmoid(),
+            )
+            nn.init.constant_(self.periodic_gate[0].bias, 1.0)
 
         # 2. Multi-scale temporal decomposition
         self.mtd = MultiScaleDecomposition(hidden_dim, trend_kernel, period_kernel)
@@ -118,17 +127,18 @@ class DeSTLLM(nn.Module):
         attn = torch.softmax(scores / (D ** 0.5), dim=1)    # scaled dot-product
         return (x * attn.unsqueeze(-1)).sum(dim=1)          # [B, N, D]
 
-    def forward(self, history_data):
+    def forward(self, history_data, future_daily=None):
         # history_data: [B, C, N, T]  (ST-LLM convention from train.py transpose)
+        # future_daily: [B, N, H] or None, normalised daily ref at each horizon
         x = history_data.permute(0, 3, 2, 1)   # -> [B, T, N, C]
         B, T, N, C = x.shape
 
-        # --- extract flow signal and auxiliary time features ---
+        # --- extract flow, time features, and daily reference ---
         flow = x[..., 0:1]                                    # [B, T, N, 1]
         if self.has_time_features:
-            time_feat = x[..., 1:]                             # [B, T, N, C-1]
+            time_feat = x[..., 1:3]                            # [B, T, N, 2]  tod + dow
         else:
-            time_feat = torch.zeros(B, T, N, 1, device=x.device)
+            time_feat = torch.zeros(B, T, N, 2, device=x.device)
 
         # --- 1. flow projection with local temporal context ---
         flow = flow.permute(0, 3, 2, 1)                       # [B, 1, N, T]
@@ -136,7 +146,7 @@ class DeSTLLM(nn.Module):
         flow_proj = flow_proj.permute(0, 3, 2, 1)              # [B, T, N, D]
 
         # --- 1b. time-feature injection ---
-        time_feat = time_feat.permute(0, 3, 2, 1)              # [B, C-1, N, T]
+        time_feat = time_feat.permute(0, 3, 2, 1)              # [B, 2, N, T]
         time_proj = self.time_input_proj(time_feat)             # [B, D, N, T]
         time_proj = time_proj.permute(0, 3, 2, 1)              # [B, T, N, D]
 
@@ -155,25 +165,40 @@ class DeSTLLM(nn.Module):
         periodic_p = self._temporal_pool(periodic_s)
         residual_p = self._temporal_pool(residual_s)
 
-        # --- 5. time embedding for GMSF gate ---
+        # --- 5. daily reference branch: enhance periodic component ---
+        if self.has_daily:
+            daily_flow = x[..., 3:4]                           # [B, T, N, 1]
+            daily_flow = daily_flow.permute(0, 3, 2, 1)        # [B, 1, N, T]
+            daily_proj = self.daily_proj(daily_flow)            # [B, D, N, T]
+            daily_proj = daily_proj.permute(0, 3, 2, 1)        # [B, T, N, D]
+            daily_p = self._temporal_pool(daily_proj)           # [B, N, D]
+
+        # --- 6. time embedding for GMSF gate ---
         t_embed = self.time_embed(x).squeeze(1)                # [B, N, D_t]
 
-        # --- 6. GMSF: gated fusion ---
+        # --- 7. periodic-reference gate ---
+        if self.has_daily:
+            gate_input = torch.cat([periodic_p, daily_p, t_embed], dim=-1)  # [B, N, H*2+D_t]
+            gate = self.periodic_gate(gate_input)                             # [B, N, H]
+            periodic_p = gate * periodic_p + (1 - gate) * daily_p
+
+        # --- 8. GMSF: gated fusion ---
         fused = self.gmsf([trend_p, periodic_p, residual_p], t_embed)  # [B, N, gpt_dim]
 
-        # --- 7. add node embedding ---
+        # --- 9. add node embedding ---
         fused = fused + self.node_emb.unsqueeze(0)             # [B, N, gpt_dim]
 
-        # --- 8. GPT-2: cross-node dependency modelling ---
+        # --- 10. GPT-2: cross-node dependency modelling ---
         gpt_out = self.gpt(fused)                              # [B, N, gpt_dim]
 
-        # --- 9. prediction head ---
+        # --- 11. prediction head ---
         if self.use_horizon_decoder:
             last_tod = x[:, -1, :, 1] if self.has_time_features else \
                        torch.zeros(B, N, device=x.device)
             last_dow = x[:, -1, :, 2] if self.has_time_features else \
                        torch.zeros(B, N, device=x.device)
-            out = self.decoder(gpt_out, last_tod, last_dow)        # [B, output_len, N, 1]
+            out = self.decoder(gpt_out, last_tod, last_dow,
+                               future_daily=future_daily)          # [B, output_len, N, 1]
         else:
             gpt_out = gpt_out.permute(0, 2, 1).unsqueeze(-1)      # [B, gpt_dim, N, 1]
             out = self.regression_layer(gpt_out)                   # [B, output_len, N, 1]
