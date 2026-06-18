@@ -40,6 +40,7 @@ class DeSTLLM(nn.Module):
         period_kernel=3,              # kernel size for periodic filter in MTD
         tcdg_layers=2,                # number of stacked GCN layers
         dropout=0.15,                 # dropout rate
+        use_horizon_decoder=True,     # True=HorizonAwareDecoder, False=Conv2d regression
         gpt2_path=None,               # local path to GPT-2 model directory
     ):
         super().__init__()
@@ -92,15 +93,19 @@ class DeSTLLM(nn.Module):
         self.gpt = PartiallyFrozenAttention(gpt_layers, U, dropout=dropout,
                                             gpt2_path=gpt2_path)
 
-        # 9. Horizon-aware decoder: y_{t+h,i} = f(z_i, e_h, e_{t+h}^{tod}, e_{t+h}^{dow})
-        self.decoder = HorizonAwareDecoder(
-            gpt_dim=gpt_dim,
-            output_len=output_len,
-            time_bins=time_bins,
-            time_dim=time_dim,
-            horizon_dim=time_dim,
-            dropout=dropout,
-        )
+        # 9. Prediction head
+        self.use_horizon_decoder = use_horizon_decoder
+        if use_horizon_decoder:
+            self.decoder = HorizonAwareDecoder(
+                gpt_dim=gpt_dim,
+                output_len=output_len,
+                time_bins=time_bins,
+                time_dim=time_dim,
+                horizon_dim=time_dim,
+                dropout=dropout,
+            )
+        else:
+            self.regression_layer = nn.Conv2d(gpt_dim, output_len, kernel_size=1)
 
     def param_num(self):
         return sum(p.nelement() for p in self.parameters())
@@ -118,16 +123,12 @@ class DeSTLLM(nn.Module):
         x = history_data.permute(0, 3, 2, 1)   # -> [B, T, N, C]
         B, T, N, C = x.shape
 
-        # --- extract flow signal, auxiliary time features, and last-step tod/dow ---
+        # --- extract flow signal and auxiliary time features ---
         flow = x[..., 0:1]                                    # [B, T, N, 1]
         if self.has_time_features:
             time_feat = x[..., 1:]                             # [B, T, N, C-1]
-            last_tod = x[:, -1, :, 1]                          # [B, N]
-            last_dow = x[:, -1, :, 2]                          # [B, N]
         else:
             time_feat = torch.zeros(B, T, N, 1, device=x.device)
-            last_tod = torch.zeros(B, N, device=x.device)
-            last_dow = torch.zeros(B, N, device=x.device)
 
         # --- 1. flow projection with local temporal context ---
         flow = flow.permute(0, 3, 2, 1)                       # [B, 1, N, T]
@@ -166,7 +167,15 @@ class DeSTLLM(nn.Module):
         # --- 8. GPT-2: cross-node dependency modelling ---
         gpt_out = self.gpt(fused)                              # [B, N, gpt_dim]
 
-        # --- 9. horizon-aware decode ---
-        out = self.decoder(gpt_out, last_tod, last_dow)        # [B, output_len, N, 1]
+        # --- 9. prediction head ---
+        if self.use_horizon_decoder:
+            last_tod = x[:, -1, :, 1] if self.has_time_features else \
+                       torch.zeros(B, N, device=x.device)
+            last_dow = x[:, -1, :, 2] if self.has_time_features else \
+                       torch.zeros(B, N, device=x.device)
+            out = self.decoder(gpt_out, last_tod, last_dow)        # [B, output_len, N, 1]
+        else:
+            gpt_out = gpt_out.permute(0, 2, 1).unsqueeze(-1)      # [B, gpt_dim, N, 1]
+            out = self.regression_layer(gpt_out)                   # [B, output_len, N, 1]
 
         return out

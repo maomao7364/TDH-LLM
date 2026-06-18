@@ -74,6 +74,9 @@ if _config_path and os.path.exists(_config_path):
         _cfg = _json.load(_f)
     for _k, _v in _cfg.items():
         setattr(args, _k, _v)
+    # Legacy checkpoints without use_horizon_decoder key use Conv2d regression
+    if 'use_horizon_decoder' not in _cfg:
+        args.use_horizon_decoder = False
     print(f'Loaded model config: {_config_path}')
 
 
@@ -137,6 +140,7 @@ def main():
         period_kernel=args.period_kernel,
         tcdg_layers=args.tcdg_layers,
         dropout=args.dropout,
+        use_horizon_decoder=getattr(args, 'use_horizon_decoder', False),
         gpt2_path=args.gpt2_path,
     ).to(device)
 

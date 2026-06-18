@@ -1,6 +1,5 @@
 import os as _os
-if not _os.environ.get('OMP_NUM_THREADS'):
-    _os.environ['OMP_NUM_THREADS'] = '1'
+_os.environ['OMP_NUM_THREADS'] = '1'
 
 import torch
 import numpy as np
@@ -236,7 +235,7 @@ def run_test_eval(model, dataloader, scaler, device, output_len, use_amp, title=
 # 主训练流程
 # ---------------------------------------------------------------------------
 def main():
-    seed_it(6666)
+    seed_it(2024)
 
     # --- 解析数据集路径 ---
     data_name = args.data
@@ -300,6 +299,7 @@ def main():
         period_kernel=args.period_kernel,
         tcdg_layers=args.tcdg_layers,
         dropout=args.dropout,
+        use_horizon_decoder=True,
         gpt2_path=args.gpt2_path,
     )
 
@@ -313,6 +313,7 @@ def main():
         gpt_dim=args.gpt_dim, trend_kernel=args.trend_kernel,
         period_kernel=args.period_kernel, tcdg_layers=args.tcdg_layers,
         dropout=args.dropout,
+        use_horizon_decoder=True,
     )
 
     # --- 创建 Trainer ---
