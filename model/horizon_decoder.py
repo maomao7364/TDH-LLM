@@ -16,10 +16,11 @@ class HorizonAwareDecoder(nn.Module):
     """
 
     def __init__(self, gpt_dim, output_len, time_bins=288, time_dim=64,
-                 horizon_dim=64, dropout=0.15):
+                 horizon_dim=64, dropout=0.15, reference_dim=1):
         super().__init__()
         self.output_len = output_len
         self.time_bins = time_bins
+        self.reference_dim = reference_dim
 
         # Horizon step embedding: e_h
         self.horizon_emb = nn.Parameter(torch.empty(output_len, horizon_dim))
@@ -33,8 +34,8 @@ class HorizonAwareDecoder(nn.Module):
         self.dow_emb = nn.Parameter(torch.empty(7, time_dim))
         nn.init.xavier_uniform_(self.dow_emb)
 
-        # Fusion MLP: f(z_i, e_h, e_tod, e_dow, d_{t+h}) -> scalar flow
-        fusion_in = gpt_dim + horizon_dim + time_dim * 2 + 1
+        # Fusion MLP: f(z_i, e_h, e_tod, e_dow, refs_{t+h}) -> scalar flow
+        fusion_in = gpt_dim + horizon_dim + time_dim * 2 + reference_dim
         self.fusion = nn.Sequential(
             nn.LayerNorm(fusion_in),
             nn.Linear(fusion_in, 256),
@@ -43,13 +44,14 @@ class HorizonAwareDecoder(nn.Module):
             nn.Linear(256, 1),
         )
 
-    def forward(self, z, last_tod, last_dow, future_daily=None):
+    def forward(self, z, last_tod, last_dow, future_daily=None, future_weekly=None):
         """
         Args:
             z:            [B, N, gpt_dim]  GPT-2 output per node
             last_tod:     [B, N]           tod at last input step, normalised [0, 1)
             last_dow:     [B, N]           dow at last input step, normalised [0, 1)
             future_daily: [B, N, H] or None  normalised daily ref at each horizon
+            future_weekly: [B, N, H] or None  normalised weekly ref at each horizon
         Returns:
             [B, output_len, N, 1]
         """
@@ -76,11 +78,19 @@ class HorizonAwareDecoder(nn.Module):
         # Expand node representations over horizon dimension
         z_exp = z.unsqueeze(1).expand(B, H, N, D)                                     # [B, H, N, gpt_dim]
 
-        # Future daily reference: [B, N, H] -> [B, H, N, 1]
+        # Future references: [B, N, H] -> [B, H, N, reference_dim]
+        refs = []
         if future_daily is not None:
-            fd = future_daily.permute(0, 2, 1).unsqueeze(-1)
+            refs.append(future_daily.permute(0, 2, 1).unsqueeze(-1))
+        if self.reference_dim >= 2 and future_weekly is not None:
+            refs.append(future_weekly.permute(0, 2, 1).unsqueeze(-1))
+        if refs:
+            fd = torch.cat(refs, dim=-1)
         else:
-            fd = torch.zeros(B, H, N, 1, device=z.device)
+            fd = torch.zeros(B, H, N, self.reference_dim, device=z.device)
+        if fd.size(-1) < self.reference_dim:
+            pad = torch.zeros(B, H, N, self.reference_dim - fd.size(-1), device=z.device)
+            fd = torch.cat([fd, pad], dim=-1)
 
         # Concatenate all conditions and fuse
         feat = torch.cat([z_exp, e_h, e_tod, e_dow, fd], dim=-1)                     # [B, H, N, fusion_in]

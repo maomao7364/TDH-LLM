@@ -1,5 +1,6 @@
 def validate_dataset_shapes(data, input_len=None, output_len=None,
-                            input_dim=None, num_nodes=None):
+                            input_dim=None, num_nodes=None,
+                            target_dim=None):
     """Validate train/val/test arrays against CLI/model shape settings."""
     splits = ("train", "val", "test")
     first_x = data["x_train"]
@@ -23,6 +24,7 @@ def validate_dataset_shapes(data, input_len=None, output_len=None,
         "output_len": output_len,
         "input_dim": input_dim,
         "num_nodes": num_nodes,
+        "target_dim": target_dim,
     }
     for name, value in expected.items():
         if value is not None and actual[name] != value:

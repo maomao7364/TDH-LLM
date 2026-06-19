@@ -23,6 +23,7 @@ TRAIN_RATIO = 0.6
 VAL_RATIO = 0.2
 # 5-min intervals -> 288 steps / day
 STEPS_PER_DAY = 288
+WEEKLY_OFFSET = STEPS_PER_DAY * 7
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 RAW_NPZ = os.path.join(DATA_DIR, 'PeMS04.npz')
@@ -60,7 +61,7 @@ def build_adjacency_from_csv(csv_path, num_nodes):
 def sliding_window(data, input_len, output_len):
     """
     data: (T, N, C)
-    returns: x (S, input_len, N, C), y (S, output_len, N, 2) — flow + future_daily
+    returns: x (S, input_len, N, C), y (S, output_len, N, 3) — flow + daily + weekly
     """
     T = data.shape[0]
     x_list, y_list = [], []
@@ -68,7 +69,8 @@ def sliding_window(data, input_len, output_len):
         x_list.append(data[t:t + input_len])               # [input_len, N, C]
         y_flow = data[t + input_len:t + input_len + output_len, :, 0:1]   # [H, N, 1]
         y_daily = data[t + input_len:t + input_len + output_len, :, 3:4]   # [H, N, 1]
-        y_list.append(np.concatenate([y_flow, y_daily], axis=-1))
+        y_weekly = data[t + input_len:t + input_len + output_len, :, 4:5]  # [H, N, 1]
+        y_list.append(np.concatenate([y_flow, y_daily, y_weekly], axis=-1))
     return np.stack(x_list, axis=0), np.stack(y_list, axis=0)
 
 
@@ -93,11 +95,15 @@ def main():
     daily = np.zeros_like(flow)
     daily[STEPS_PER_DAY:] = flow[:-STEPS_PER_DAY]
 
-    # Stack: [flow, time_of_day, day_of_week, daily_flow]
-    data = np.concatenate([flow, tod, dow, daily], axis=-1).astype(np.float32)  # (T, N, 4)
-    data = data[STEPS_PER_DAY:]  # drop first day (no valid daily reference)
+    # Weekly reference: flow[t - 7 * 288]
+    weekly = np.zeros_like(flow)
+    weekly[WEEKLY_OFFSET:] = flow[:-WEEKLY_OFFSET]
+
+    # Stack: [flow, time_of_day, day_of_week, daily_flow, weekly_flow]
+    data = np.concatenate([flow, tod, dow, daily, weekly], axis=-1).astype(np.float32)
+    data = data[WEEKLY_OFFSET:]  # drop first week (no valid weekly reference)
     T_new = data.shape[0]
-    print(f'Feature shape: {data.shape}  (channels: flow, tod, dow, daily_flow)')
+    print(f'Feature shape: {data.shape}  (channels: flow, tod, dow, daily_flow, weekly_flow)')
 
     # ---- chronological splits ----
     train_end = int(T_new * TRAIN_RATIO)

@@ -38,7 +38,7 @@ parser.add_argument('--adj', type=str, default=None,
                     help='邻接矩阵路径，默认自动查找')
 parser.add_argument('--topk', type=int, default=0,
                     help='邻接矩阵 top-k 稀疏化 (0=不稀疏)')
-parser.add_argument('--input_dim', type=int, default=4)
+parser.add_argument('--input_dim', type=int, default=5)
 parser.add_argument('--num_nodes', type=int, default=50,
                     help='路网节点数')
 parser.add_argument('--input_len', type=int, default=24, help='输入时间步长 (24=2h)')
@@ -135,6 +135,7 @@ def main():
         output_len=args.output_len,
         input_dim=args.input_dim,
         num_nodes=args.num_nodes,
+        target_dim=3 if args.input_dim >= 5 else 2,
     )
     print(f'Data shape: input_len={shape_info["input_len"]}, '
           f'output_len={shape_info["output_len"]}, '
@@ -192,7 +193,9 @@ def main():
             test_y = y.float().to(device, non_blocking=True)
             test_y = test_y.transpose(1, 3)                     # [B, C_y, N, H]
             test_fd = test_y[:, 1, :, :] if test_y.size(1) > 1 else None
-            out = model(test_x, future_daily=test_fd).transpose(1, 3)  # [B, 1, N, out_len]
+            test_fw = test_y[:, 2, :, :] if test_y.size(1) > 2 else None
+            out = model(test_x, future_daily=test_fd,
+                        future_weekly=test_fw).transpose(1, 3)  # [B, 1, N, out_len]
             preds.append(out.squeeze(1))
 
     y_hat = torch.cat(preds, dim=0)                            # [samples, N, out_len]

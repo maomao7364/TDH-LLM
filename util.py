@@ -60,10 +60,18 @@ def load_dataset(dataset_dir, batch_size, valid_batch_size=None, test_batch_size
         if data['x_' + category].shape[-1] >= 4:
             data['x_' + category][..., 3] = scaler.transform(
                 data['x_' + category][..., 3])
+        # weekly_flow (channel 4) also shares the same distribution as flow
+        if data['x_' + category].shape[-1] >= 5:
+            data['x_' + category][..., 4] = scaler.transform(
+                data['x_' + category][..., 4])
         # y channel 1 = future_daily reference, same distribution
         if data['y_' + category].shape[-1] >= 2:
             data['y_' + category][..., 1] = scaler.transform(
                 data['y_' + category][..., 1])
+        # y channel 2 = future_weekly reference, same distribution
+        if data['y_' + category].shape[-1] >= 3:
+            data['y_' + category][..., 2] = scaler.transform(
+                data['y_' + category][..., 2])
 
     # Note: PyTorch DataLoader handles shuffling each epoch via shuffle=True,
     # so we don't manually permute the arrays here.

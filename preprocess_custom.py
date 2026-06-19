@@ -25,6 +25,7 @@ SRC_DIR = os.path.join(_script_dir, 'data', 'pems 07-1')
 OUT_DIR = os.path.join(_script_dir, 'data', 'pems07_custom')
 
 STEPS_PER_DAY = 288
+WEEKLY_OFFSET = STEPS_PER_DAY * 7
 TRAIN_RATIO = 0.6
 VAL_RATIO = 0.2
 
@@ -61,7 +62,8 @@ def sliding_window(data, input_len, output_len):
         xs.append(data[t:t + input_len])
         y_flow = data[t + input_len:t + window, :, 0:1]   # [H, N, 1]
         y_daily = data[t + input_len:t + window, :, 3:4]   # [H, N, 1] future daily ref
-        ys.append(np.concatenate([y_flow, y_daily], axis=-1))
+        y_weekly = data[t + input_len:t + window, :, 4:5]  # [H, N, 1] future weekly ref
+        ys.append(np.concatenate([y_flow, y_daily, y_weekly], axis=-1))
     return np.stack(xs, axis=0), np.stack(ys, axis=0)
 
 
@@ -110,10 +112,15 @@ def main():
     daily = np.zeros_like(flow_3d)
     daily[STEPS_PER_DAY:] = flow_3d[:-STEPS_PER_DAY]
 
-    data = np.concatenate([flow_3d, tod, dow, daily], axis=-1).astype(np.float32)
-    data = data[STEPS_PER_DAY:]  # drop first day (no valid daily reference)
+    # Weekly reference: flow[t - 7 * 288]
+    weekly = np.zeros_like(flow_3d)
+    weekly[WEEKLY_OFFSET:] = flow_3d[:-WEEKLY_OFFSET]
+
+    data = np.concatenate([flow_3d, tod, dow, daily, weekly], axis=-1).astype(np.float32)
+    data = data[WEEKLY_OFFSET:]  # drop first week (no valid weekly reference)
     T_new = data.shape[0]
-    print(f'Features: {data.shape}  (flow, tod, dow, daily_flow)  [{T_new} steps, first day dropped]')
+    print(f'Features: {data.shape}  (flow, tod, dow, daily_flow, weekly_flow)  '
+          f'[{T_new} steps, first week dropped]')
 
     # --- Chronological splits ---
     train_end = int(T_new * TRAIN_RATIO)

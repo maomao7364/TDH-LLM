@@ -36,6 +36,10 @@ class PreprocessConfigTest(unittest.TestCase):
 
     def test_custom_preprocess_splits_after_dropping_first_day(self):
         source = (ROOT / "preprocess_custom.py").read_text(encoding="utf-8")
+        self.assertIn("WEEKLY_OFFSET = STEPS_PER_DAY * 7", source)
+        self.assertIn("weekly = np.zeros_like(flow_3d)", source)
+        self.assertIn("weekly[WEEKLY_OFFSET:] = flow_3d[:-WEEKLY_OFFSET]", source)
+        self.assertIn("data = data[WEEKLY_OFFSET:]", source)
         self.assertIn("train_end = int(T_new * TRAIN_RATIO)", source)
         self.assertIn("val_end = int(T_new * (TRAIN_RATIO + VAL_RATIO))", source)
         self.assertNotIn("train_end = int(T * TRAIN_RATIO)", source)
@@ -44,12 +48,16 @@ class PreprocessConfigTest(unittest.TestCase):
         source = (ROOT / "preprocess_pems.py").read_text(encoding="utf-8")
         self.assertIn("INPUT_LEN = 24", source)
         self.assertIn("OUTPUT_LEN = 24", source)
+        self.assertIn("WEEKLY_OFFSET = STEPS_PER_DAY * 7", source)
+        self.assertIn("weekly = np.zeros_like(flow)", source)
+        self.assertIn("weekly[WEEKLY_OFFSET:] = flow[:-WEEKLY_OFFSET]", source)
+        self.assertIn("data = data[WEEKLY_OFFSET:]", source)
         self.assertIn("train_end = int(T_new * TRAIN_RATIO)", source)
         self.assertIn("val_end = int(T_new * (TRAIN_RATIO + VAL_RATIO))", source)
 
 
 class DatasetShapeValidationTest(unittest.TestCase):
-    def _data(self, x_shape=(2, 24, 50, 4), y_shape=(2, 24, 50, 2)):
+    def _data(self, x_shape=(2, 24, 50, 5), y_shape=(2, 24, 50, 3)):
         x = np.zeros(x_shape, dtype=np.float32)
         y = np.zeros(y_shape, dtype=np.float32)
         return {
@@ -65,10 +73,12 @@ class DatasetShapeValidationTest(unittest.TestCase):
         from dataset_checks import validate_dataset_shapes
 
         info = validate_dataset_shapes(
-            self._data(), input_len=24, output_len=24, input_dim=4, num_nodes=50
+            self._data(), input_len=24, output_len=24, input_dim=5,
+            num_nodes=50, target_dim=3,
         )
         self.assertEqual(info["input_len"], 24)
-        self.assertEqual(info["input_dim"], 4)
+        self.assertEqual(info["input_dim"], 5)
+        self.assertEqual(info["target_dim"], 3)
 
     def test_validate_dataset_shapes_rejects_input_len_mismatch(self):
         from dataset_checks import validate_dataset_shapes
@@ -78,8 +88,22 @@ class DatasetShapeValidationTest(unittest.TestCase):
                 self._data(x_shape=(2, 12, 50, 4)),
                 input_len=24,
                 output_len=24,
-                input_dim=4,
+                input_dim=5,
                 num_nodes=50,
+                target_dim=3,
+            )
+
+    def test_validate_dataset_shapes_rejects_target_dim_mismatch(self):
+        from dataset_checks import validate_dataset_shapes
+
+        with self.assertRaisesRegex(ValueError, "target_dim"):
+            validate_dataset_shapes(
+                self._data(y_shape=(2, 24, 50, 2)),
+                input_len=24,
+                output_len=24,
+                input_dim=5,
+                num_nodes=50,
+                target_dim=3,
             )
 
 
