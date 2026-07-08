@@ -217,19 +217,66 @@ def compute_metrics(y_true, y_pred):
     )
 
 
+def compute_selected_horizon_node_metrics(y_true, y_pred, horizons, mask_value=0.0):
+    """Compute per-node metrics at selected one-based forecast horizons."""
+    valid_horizons = [h for h in horizons if 1 <= h <= y_true.shape[-1]]
+    if not valid_horizons:
+        valid_horizons = [y_true.shape[-1]]
+    indices = [h - 1 for h in valid_horizons]
+    true_sel = y_true[:, :, indices]
+    pred_sel = y_pred[:, :, indices]
+    valid = true_sel > mask_value
+    err = pred_sel - true_sel
+    abs_err = np.abs(err)
+    sq_err = err ** 2
+    safe_true = np.where(valid, np.abs(true_sel), 1.0)
+
+    mae = masked_mean(abs_err, valid, axis=0)
+    rmse = np.sqrt(masked_mean(sq_err, valid, axis=0))
+    mape = masked_mean(abs_err / safe_true, valid, axis=0)
+    wmape = np.sum(np.where(valid, abs_err, 0.0), axis=0) / np.maximum(
+        np.sum(np.where(valid, np.abs(true_sel), 0.0), axis=0), 1e-8
+    )
+    return dict(
+        horizons=np.array(valid_horizons, dtype=int),
+        minutes=np.array(valid_horizons, dtype=int) * 5,
+        mae=mae,
+        rmse=rmse,
+        mape=mape,
+        wmape=wmape,
+    )
+
+
+def select_representative_node(per_node_mae):
+    """Pick the node closest to the median MAE for representative line plots."""
+    per_node_mae = np.asarray(per_node_mae, dtype=float)
+    median = np.nanmedian(per_node_mae)
+    return int(np.nanargmin(np.abs(per_node_mae - median)))
+
+
 def set_plot_style():
     plt.rcParams.update({
         'figure.dpi': 140,
-        'savefig.dpi': 300,
-        'font.size': 10,
-        'axes.titlesize': 11,
-        'axes.labelsize': 10,
+        'savefig.dpi': 600,
+        'font.size': 9,
+        'axes.titlesize': 10,
+        'axes.labelsize': 9,
         'axes.grid': True,
         'grid.alpha': 0.25,
         'axes.spines.top': False,
         'axes.spines.right': False,
         'legend.frameon': False,
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans', 'sans-serif'],
+        'svg.fonttype': 'none',
+        'pdf.fonttype': 42,
     })
+
+
+def save_pub_figure(fig, out_dir, stem):
+    for ext in ('png', 'svg', 'pdf'):
+        fig.savefig(os.path.join(out_dir, f'{stem}.{ext}'), bbox_inches='tight')
+    plt.close(fig)
 
 
 def save_csvs(out_dir, metrics):
@@ -248,6 +295,25 @@ def save_csvs(out_dir, metrics):
     })
     node_df.to_csv(os.path.join(out_dir, 'per_node_metrics.csv'), index=False)
     horizon_df.to_csv(os.path.join(out_dir, 'per_horizon_metrics.csv'), index=False)
+
+
+def save_selected_horizon_node_metrics(out_dir, selected_metrics):
+    rows = []
+    nodes = np.arange(selected_metrics['mae'].shape[0])
+    for c, horizon in enumerate(selected_metrics['horizons']):
+        for node in nodes:
+            rows.append(dict(
+                node=int(node),
+                horizon=int(horizon),
+                minutes=int(horizon * 5),
+                mae=float(selected_metrics['mae'][node, c]),
+                rmse=float(selected_metrics['rmse'][node, c]),
+                mape=float(selected_metrics['mape'][node, c]),
+                wmape=float(selected_metrics['wmape'][node, c]),
+            ))
+    pd.DataFrame(rows).to_csv(
+        os.path.join(out_dir, 'selected_horizon_node_metrics.csv'), index=False
+    )
 
 
 def plot_forecast_grid(y_true, y_pred, nodes, horizons, max_points, out_dir):
@@ -290,6 +356,228 @@ def plot_error_grid(abs_err, nodes, horizons, max_points, out_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, 'station_error_grid.png'), bbox_inches='tight')
     plt.close(fig)
+
+
+def _radar_axes(num_nodes):
+    angles = np.linspace(0, 2 * np.pi, num_nodes, endpoint=False)
+    closed_angles = np.r_[angles, angles[0]]
+    return angles, closed_angles
+
+
+def _style_sci_radar(ax, angles, nodes, r_max, r_ticks=None):
+    tick_labels = [str(n) if n % 5 == 0 else '' for n in nodes]
+    ax.set_theta_zero_location('N')
+    ax.set_theta_direction(-1)
+    ax.set_xticks(angles)
+    ax.set_xticklabels(tick_labels, fontsize=6.5, color='#374151')
+    ax.set_ylim(0, r_max)
+    if r_ticks is not None:
+        ax.set_yticks(r_ticks)
+    ax.set_rlabel_position(88)
+    ax.tick_params(axis='y', labelsize=6.5, colors='#4B5563', pad=1)
+    ax.grid(False)
+    ax.spines['polar'].set_visible(False)
+
+    closed_angles = np.r_[angles, angles[0]]
+    for radius in ax.get_yticks():
+        if 0 < radius <= r_max:
+            ax.plot(
+                closed_angles,
+                np.full_like(closed_angles, radius, dtype=float),
+                color='#CBD5E1',
+                lw=0.65,
+                zorder=0,
+            )
+    ax.plot(
+        closed_angles,
+        np.full_like(closed_angles, r_max, dtype=float),
+        color='#475569',
+        lw=0.9,
+        zorder=1,
+    )
+    for angle in angles:
+        ax.plot([angle, angle], [0, r_max], color='#E5E7EB', lw=0.45, zorder=0)
+
+
+def _nice_radar_limit(values):
+    vmax = float(np.nanmax(values)) if np.size(values) else 0.0
+    if not np.isfinite(vmax) or vmax <= 0:
+        return 1.0
+    raw = vmax * 1.12
+    magnitude = 10 ** np.floor(np.log10(raw))
+    scaled = raw / magnitude
+    if scaled <= 2:
+        nice = 2
+    elif scaled <= 5:
+        nice = 5
+    else:
+        nice = 10
+    return nice * magnitude
+
+
+def plot_selected_horizon_radars(selected_metrics, out_dir):
+    nodes = np.arange(selected_metrics['mae'].shape[0])
+    angles, closed_angles = _radar_axes(len(nodes))
+    colors = ['#3B6FB6', '#2A9D8F', '#E76F51', '#7B61A8']
+    metric_specs = [
+        ('mae', 'MAE', 'Flow error', 1.0),
+        ('rmse', 'RMSE', 'Flow error', 1.0),
+        ('mape', 'MAPE (%)', 'Relative error (%)', 100.0),
+    ]
+
+    for metric_key, title, ylabel, scale in metric_specs:
+        values = selected_metrics[metric_key] * scale
+        r_max = _nice_radar_limit(values)
+        r_ticks = np.linspace(0, r_max, 5)[1:]
+        fig, ax = plt.subplots(figsize=(7.2, 7.2), subplot_kw={'projection': 'polar'})
+        _style_sci_radar(ax, angles, nodes, r_max, r_ticks)
+        for idx, minute in enumerate(selected_metrics['minutes']):
+            series = values[:, idx]
+            closed_series = np.r_[series, series[0]]
+            ax.plot(
+                closed_angles,
+                closed_series,
+                lw=1.8,
+                color=colors[idx % len(colors)],
+                label=f'{int(minute)} min',
+                zorder=3,
+            )
+            ax.fill(
+                closed_angles,
+                closed_series,
+                color=colors[idx % len(colors)],
+                alpha=0.06,
+                zorder=2,
+            )
+        ax.set_title(f'Per-node {title} across forecast horizons', pad=24, fontsize=11)
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.07), ncol=4, fontsize=8)
+        fig.tight_layout()
+        save_pub_figure(fig, out_dir, f'sci_per_node_{metric_key}_radar_by_horizon')
+
+    fig, axes = plt.subplots(1, 3, figsize=(14.2, 4.8), subplot_kw={'projection': 'polar'})
+    for ax, (metric_key, title, _, scale) in zip(axes, metric_specs):
+        values = selected_metrics[metric_key] * scale
+        denom = max(float(np.nanmax(values)), 1e-8)
+        _style_sci_radar(ax, angles, nodes, 1.0, np.linspace(0.25, 1.0, 4))
+        for idx, minute in enumerate(selected_metrics['minutes']):
+            series = values[:, idx] / denom
+            ax.plot(
+                closed_angles,
+                np.r_[series, series[0]],
+                lw=1.35,
+                color=colors[idx % len(colors)],
+                label=f'{int(minute)} min',
+                zorder=3,
+            )
+            ax.fill(
+                closed_angles,
+                np.r_[series, series[0]],
+                color=colors[idx % len(colors)],
+                alpha=0.045,
+                zorder=2,
+            )
+        ax.set_title(title, pad=18, fontsize=10)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=len(labels), bbox_to_anchor=(0.5, -0.02), fontsize=8)
+    fig.suptitle('Normalized 50-node error radar by forecast horizon', y=1.02, fontsize=11)
+    fig.tight_layout()
+    save_pub_figure(fig, out_dir, 'sci_per_node_error_radar_by_horizon_normalized_panel')
+
+    fig, axes = plt.subplots(
+        len(metric_specs),
+        len(selected_metrics['minutes']),
+        figsize=(14.4, 10.2),
+        subplot_kw={'projection': 'polar'},
+        squeeze=False,
+    )
+    for row, (metric_key, title, _, scale) in enumerate(metric_specs):
+        values = selected_metrics[metric_key] * scale
+        r_max = _nice_radar_limit(values)
+        r_ticks = np.linspace(0, r_max, 4)[1:]
+        for col, minute in enumerate(selected_metrics['minutes']):
+            ax = axes[row, col]
+            series = values[:, col]
+            closed_series = np.r_[series, series[0]]
+            _style_sci_radar(ax, angles, nodes, r_max, r_ticks)
+            ax.plot(closed_angles, closed_series, color=colors[col % len(colors)], lw=1.55, zorder=3)
+            ax.fill(closed_angles, closed_series, color=colors[col % len(colors)], alpha=0.12, zorder=2)
+            ax.set_title(f'{title} | {int(minute)} min', pad=14, fontsize=8.5)
+    fig.suptitle('Station-wise prediction errors at selected forecast horizons', y=0.995, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    save_pub_figure(fig, out_dir, 'sci_per_node_error_radar_metric_horizon_panel')
+
+
+def plot_selected_horizon_heatmaps(selected_metrics, out_dir):
+    metric_specs = [
+        ('mae', 'MAE'),
+        ('rmse', 'RMSE'),
+        ('mape', 'MAPE'),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(12.6, 5.0), sharey=True)
+    for ax, (metric_key, title) in zip(axes, metric_specs):
+        mat = selected_metrics[metric_key]
+        im = ax.imshow(mat, aspect='auto', cmap='magma' if metric_key == 'mape' else 'viridis')
+        ax.set_title(f'Node x horizon {title}')
+        ax.set_xlabel('Forecast horizon')
+        ax.set_xticks(np.arange(len(selected_metrics['minutes'])))
+        ax.set_xticklabels([f'{int(m)}' for m in selected_metrics['minutes']])
+        ax.set_ylabel('Node')
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    save_pub_figure(fig, out_dir, 'selected_horizon_node_metric_heatmaps')
+
+
+def plot_station_multiday_forecast(y_true, y_pred, node, horizons, days, out_dir):
+    points = min(max(int(days * 288), 1), y_true.shape[0])
+    valid_horizons = [h for h in horizons if 1 <= h <= y_true.shape[-1]]
+    if not valid_horizons:
+        valid_horizons = [y_true.shape[-1]]
+    valid_horizons = valid_horizons[:4]
+    x_axis = np.arange(points) / 288.0
+    ncols = 2
+    nrows = int(np.ceil(len(valid_horizons) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(10.8, 3.0 * nrows), squeeze=False)
+    rows = []
+    for idx, horizon in enumerate(valid_horizons):
+        r, c = divmod(idx, ncols)
+        ax = axes[r][c]
+        h_idx = horizon - 1
+        true_series = y_true[:points, node, h_idx]
+        pred_series = y_pred[:points, node, h_idx]
+        valid = true_series > 0
+        mae = np.mean(np.abs(pred_series[valid] - true_series[valid])) if np.any(valid) else np.nan
+        ax.plot(x_axis, true_series, color='#111827', lw=1.25, label='Ground truth')
+        ax.plot(x_axis, pred_series, color='#2563EB', lw=1.15, alpha=0.92, label='Prediction')
+        ax.fill_between(
+            x_axis,
+            true_series,
+            pred_series,
+            color='#93C5FD',
+            alpha=0.20,
+            linewidth=0,
+        )
+        ax.set_title(f'Node {node}, {horizon * 5} min horizon (MAE={mae:.2f})')
+        ax.set_xlabel('Test time (days)')
+        ax.set_ylabel('Flow')
+        if idx == 0:
+            ax.legend(loc='upper right')
+        for sample_idx in range(points):
+            rows.append(dict(
+                sample=sample_idx,
+                day=sample_idx / 288.0,
+                node=int(node),
+                horizon=int(horizon),
+                minutes=int(horizon * 5),
+                true=float(true_series[sample_idx]),
+                pred=float(pred_series[sample_idx]),
+            ))
+    for ax in axes.ravel()[len(valid_horizons):]:
+        ax.axis('off')
+    fig.tight_layout()
+    save_pub_figure(fig, out_dir, f'station_{node}_multiday_forecast')
+    pd.DataFrame(rows).to_csv(
+        os.path.join(out_dir, f'station_{node}_multiday_forecast.csv'), index=False
+    )
 
 
 def plot_node_metrics(metrics, out_dir, topk):
@@ -425,6 +713,12 @@ def main():
     parser.add_argument('--horizons', default='3,6,12,24', help='Comma-separated horizon steps')
     parser.add_argument('--max_points', type=int, default=288)
     parser.add_argument('--top_error_nodes', type=int, default=20)
+    parser.add_argument('--analysis_horizons', default='6,12,18,24',
+                        help='Horizon steps for result-analysis radar/heatmap figures')
+    parser.add_argument('--analysis_days', type=float, default=3.0,
+                        help='Number of test days for station prediction comparison')
+    parser.add_argument('--analysis_node', type=int, default=None,
+                        help='Node for multi-day comparison; default selects median-MAE node')
     parser.add_argument('--reference_mode', default='full_refs',
                         choices=['full_refs', 'no_daily', 'no_weekly', 'no_refs'])
     parser.add_argument('--module_variant', default=None)
@@ -461,16 +755,23 @@ def main():
 
     nodes = parse_int_list(args.nodes)
     horizons = parse_int_list(args.horizons)
+    analysis_horizons = parse_int_list(args.analysis_horizons)
     nodes = [n for n in nodes if 0 <= n < args.num_nodes]
     horizons = [h for h in horizons if 1 <= h <= args.output_len]
+    analysis_horizons = [h for h in analysis_horizons if 1 <= h <= args.output_len]
     if not nodes:
         nodes = [0]
     if not horizons:
         horizons = [args.output_len]
+    if not analysis_horizons:
+        analysis_horizons = horizons
 
     set_plot_style()
     y_true, y_pred = infer_predictions(args, cfg)
     metrics = compute_metrics(y_true, y_pred)
+    selected_metrics = compute_selected_horizon_node_metrics(
+        y_true, y_pred, analysis_horizons
+    )
     np.savez_compressed(
         os.path.join(out_dir, 'test_predictions.npz'),
         y_true=y_true,
@@ -478,10 +779,19 @@ def main():
         abs_error=metrics['abs_err'],
     )
     save_csvs(out_dir, metrics)
+    save_selected_horizon_node_metrics(out_dir, selected_metrics)
     plot_forecast_grid(y_true, y_pred, nodes, horizons, args.max_points, out_dir)
     plot_error_grid(metrics['abs_err'], nodes, horizons, args.max_points, out_dir)
     plot_node_metrics(metrics, out_dir, args.top_error_nodes)
     plot_node_radar(metrics, out_dir)
+    plot_selected_horizon_radars(selected_metrics, out_dir)
+    plot_selected_horizon_heatmaps(selected_metrics, out_dir)
+    analysis_node = args.analysis_node
+    if analysis_node is None or not (0 <= analysis_node < args.num_nodes):
+        analysis_node = select_representative_node(metrics['per_node_mae'])
+    plot_station_multiday_forecast(
+        y_true, y_pred, analysis_node, analysis_horizons, args.analysis_days, out_dir
+    )
     plot_horizon_metrics(metrics, out_dir)
     plot_node_horizon_heatmap(metrics, out_dir)
     plot_error_distribution(metrics, out_dir)

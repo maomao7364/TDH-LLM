@@ -18,14 +18,21 @@ import pandas as pd
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 PALETTE = {
     "black": "#111827",
-    "blue": "#2563EB",
-    "sky": "#60A5FA",
-    "green": "#059669",
-    "orange": "#EA580C",
-    "red": "#DC2626",
+    "blue": "#4C78A8",
+    "sky": "#8FB8DE",
+    "green": "#8DAA91",
+    "orange": "#C9895B",
+    "red": "#B56576",
     "purple": "#7C3AED",
     "gray": "#64748B",
     "light_gray": "#E5E7EB",
+    "residual_hist": "#9DBAD5",
+    "residual_kde": "#3F6E9F",
+    "residual_mean": "#4B5563",
+    "gate_reference": "#7C97B8",
+    "gate_trend": "#8DAA91",
+    "gate_periodic": "#7EA6B8",
+    "gate_residual": "#D2A66A",
 }
 TIME_PERIODS = ["Night", "Morning peak", "Off-peak", "Evening peak"]
 
@@ -123,15 +130,18 @@ def kde_curve(values, grid_size=256, max_points=50000):
 
 def set_plot_style():
     plt.rcParams.update({
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"],
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "DejaVu Serif", "serif"],
         "svg.fonttype": "none",
         "pdf.fonttype": 42,
         "figure.dpi": 140,
         "savefig.dpi": 600,
-        "font.size": 8,
-        "axes.titlesize": 9,
-        "axes.labelsize": 8,
+        "font.size": 11,
+        "axes.titlesize": 13,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10.5,
+        "ytick.labelsize": 10.5,
+        "legend.fontsize": 11,
         "axes.spines.top": False,
         "axes.spines.right": False,
         "axes.grid": True,
@@ -140,13 +150,11 @@ def set_plot_style():
     })
 
 
-def save_figure(fig, out_dir, stem):
-    png_path = os.path.join(out_dir, f"{stem}.png")
-    svg_path = os.path.join(out_dir, f"{stem}.svg")
-    pdf_path = os.path.join(out_dir, f"{stem}.pdf")
-    fig.savefig(png_path, bbox_inches="tight")
-    fig.savefig(svg_path, bbox_inches="tight")
-    fig.savefig(pdf_path, bbox_inches="tight")
+def save_figure(fig, out_dir, stem, formats=None):
+    if formats is None:
+        formats = ["png", "svg", "pdf"]
+    for fmt in formats:
+        fig.savefig(os.path.join(out_dir, f"{stem}.{fmt}"), bbox_inches="tight")
     plt.close(fig)
 
 
@@ -359,54 +367,78 @@ def run_inference_with_intermediates(args, cfg):
     return y_true, y_pred, captured
 
 
+def sample_residual_for_plot(residual, max_points=200000):
+    if residual.size > max_points:
+        rng = np.random.default_rng(6666)
+        return rng.choice(residual, size=max_points, replace=False)
+    return residual
+
+
+def draw_residual_distribution(ax, residual, summary, minutes):
+    residual = sample_residual_for_plot(residual)
+    ax.hist(
+        residual,
+        bins=70,
+        density=True,
+        color=PALETTE["residual_hist"],
+        alpha=0.66,
+        edgecolor="white",
+        linewidth=0.3,
+    )
+    x_grid, density = kde_curve(residual)
+    if x_grid.size:
+        ax.plot(x_grid, density, color=PALETTE["residual_kde"], lw=1.55)
+    ax.axvline(0, color=PALETTE["red"], lw=1.0, ls="--")
+    ax.axvline(summary["mean"], color=PALETTE["residual_mean"], lw=1.0)
+    ax.text(
+        0.03,
+        0.94,
+        f"\u03bc={summary['mean']:.2f}\n\u03c3={summary['std']:.2f}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=11,
+        bbox=dict(facecolor="white", edgecolor="none", alpha=0.70, pad=1.8),
+    )
+    ax.set_title(f"{minutes} min residual")
+    ax.set_xlabel("Prediction residual")
+    ax.set_ylabel("Density")
+
+
 def plot_residual_distributions(y_true, y_pred, out_dir):
     horizon_indices = key_horizon_indices(y_true.shape[-1])
     if not horizon_indices:
         horizon_indices = [y_true.shape[-1] - 1]
-    fig, axes = plt.subplots(2, 2, figsize=(7.2, 5.4), squeeze=False)
+    fig, axes = plt.subplots(2, 2, figsize=(8.8, 6.8), squeeze=False)
     summaries = []
+    residual_items = []
     for ax, h_idx in zip(axes.ravel(), horizon_indices):
         valid = y_true[:, :, h_idx] > 0
         residual = (y_pred[:, :, h_idx] - y_true[:, :, h_idx])[valid]
         summary = residual_summary(y_true[:, :, h_idx], y_pred[:, :, h_idx])
+        minutes = (h_idx + 1) * 5
         summaries.append({
             "horizon": h_idx + 1,
-            "minutes": (h_idx + 1) * 5,
+            "minutes": minutes,
             **summary,
         })
-        if residual.size > 200000:
-            rng = np.random.default_rng(6666)
-            residual = rng.choice(residual, size=200000, replace=False)
-        ax.hist(
-            residual,
-            bins=70,
-            density=True,
-            color=PALETTE["sky"],
-            alpha=0.62,
-            edgecolor="white",
-            linewidth=0.3,
-        )
-        x_grid, density = kde_curve(residual)
-        if x_grid.size:
-            ax.plot(x_grid, density, color=PALETTE["blue"], lw=1.5)
-        ax.axvline(0, color=PALETTE["red"], lw=1.0, ls="--")
-        ax.axvline(summary["mean"], color=PALETTE["black"], lw=1.0)
-        ax.text(
-            0.03,
-            0.94,
-            f"mu={summary['mean']:.2f}\nsigma={summary['std']:.2f}",
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=8,
-        )
-        ax.set_title(f"{(h_idx + 1) * 5} min residual")
-        ax.set_xlabel("Prediction residual")
-        ax.set_ylabel("Density")
+        residual_items.append((h_idx, minutes, residual, summary))
+        draw_residual_distribution(ax, residual, summary, minutes)
     for ax in axes.ravel()[len(horizon_indices):]:
         ax.axis("off")
     fig.tight_layout()
     save_figure(fig, out_dir, "residual_distribution_by_horizon")
+
+    for h_idx, minutes, residual, summary in residual_items:
+        single_fig, single_ax = plt.subplots(figsize=(4.6, 3.8))
+        draw_residual_distribution(single_ax, residual, summary, minutes)
+        single_fig.tight_layout()
+        save_figure(
+            single_fig,
+            out_dir,
+            f"residual_distribution_{minutes}min",
+        )
+
     pd.DataFrame(summaries).to_csv(
         os.path.join(out_dir, "residual_distribution_summary.csv"), index=False
     )
@@ -417,7 +449,7 @@ def plot_mtd_example(example, out_dir):
         print("MTD example unavailable; skipped MTD response figure.")
         return
     steps = np.arange(1, len(example["flow"]) + 1)
-    fig, axes = plt.subplots(2, 1, figsize=(6.4, 4.6), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(7.4, 5.4), sharex=True)
     axes[0].plot(steps, example["flow"], color=PALETTE["black"], lw=1.4)
     axes[0].set_ylabel("Flow")
     axes[0].set_title(
@@ -436,6 +468,29 @@ def plot_mtd_example(example, out_dir):
     axes[1].legend(ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.23))
     fig.tight_layout()
     save_figure(fig, out_dir, "mtd_component_response")
+
+    flow_fig, flow_ax = plt.subplots(figsize=(5.0, 3.2))
+    flow_ax.plot(steps, example["flow"], color=PALETTE["black"], lw=1.5)
+    flow_ax.set_xlabel("Historical time step")
+    flow_ax.set_ylabel("Flow")
+    flow_ax.set_title(f"Input flow, node {example['node']}")
+    flow_fig.tight_layout()
+    save_figure(flow_fig, out_dir, "mtd_input_flow")
+
+    comp_fig, comp_ax = plt.subplots(figsize=(5.2, 3.5))
+    comp_ax.plot(steps, minmax(example["trend"]), color=PALETTE["gate_trend"], lw=1.5, label="Trend")
+    comp_ax.plot(
+        steps, minmax(example["periodic"]), color=PALETTE["gate_periodic"], lw=1.5, label="Periodic"
+    )
+    comp_ax.plot(
+        steps, minmax(example["residual"]), color=PALETTE["gate_residual"], lw=1.5, label="Residual"
+    )
+    comp_ax.set_xlabel("Historical time step")
+    comp_ax.set_ylabel("Normalised hidden response")
+    comp_ax.set_title("MTD component response strength")
+    comp_ax.legend(ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.24))
+    comp_fig.tight_layout()
+    save_figure(comp_fig, out_dir, "mtd_component_response_strength")
 
 
 def aggregate_gates_by_period(tod, ref_dependency, gmsf_weights):
@@ -468,10 +523,10 @@ def plot_gate_analysis(tod, ref_dependency, gmsf_weights, out_dir):
     df = aggregate_gates_by_period(tod, ref_dependency, gmsf_weights)
     df.to_csv(os.path.join(out_dir, "gate_weights_by_time_period.csv"), index=False)
 
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.0))
+    fig, axes = plt.subplots(1, 2, figsize=(8.8, 3.8))
     x = np.arange(len(df))
     if "reference_dependency" in df:
-        axes[0].bar(x, df["reference_dependency"], color=PALETTE["blue"], width=0.68)
+        axes[0].bar(x, df["reference_dependency"], color=PALETTE["gate_reference"], width=0.68)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(df["period"], rotation=25, ha="right")
     axes[0].set_ylim(0, 1)
@@ -480,9 +535,9 @@ def plot_gate_analysis(tod, ref_dependency, gmsf_weights, out_dir):
 
     bottoms = np.zeros(len(df))
     series = [
-        ("Trend", "trend_weight", PALETTE["green"]),
-        ("Periodic", "periodic_weight", PALETTE["blue"]),
-        ("Residual", "residual_weight", PALETTE["orange"]),
+        ("Trend", "trend_weight", PALETTE["gate_trend"]),
+        ("Periodic", "periodic_weight", PALETTE["gate_periodic"]),
+        ("Residual", "residual_weight", PALETTE["gate_residual"]),
     ]
     for label, column, color in series:
         values = df[column].to_numpy(dtype=float)
@@ -496,6 +551,32 @@ def plot_gate_analysis(tod, ref_dependency, gmsf_weights, out_dir):
     axes[1].legend(loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=3)
     fig.tight_layout()
     save_figure(fig, out_dir, "gate_weights_by_time_period")
+
+    ref_fig, ref_ax = plt.subplots(figsize=(5.0, 3.8))
+    if "reference_dependency" in df:
+        ref_ax.bar(x, df["reference_dependency"], color=PALETTE["gate_reference"], width=0.62)
+    ref_ax.set_xticks(x)
+    ref_ax.set_xticklabels(df["period"], rotation=25, ha="right")
+    ref_ax.set_ylim(0, 1)
+    ref_ax.set_ylabel("Mean 1 - gate")
+    ref_ax.set_title("Periodic reference dependency")
+    ref_fig.tight_layout()
+    save_figure(ref_fig, out_dir, "gate_reference_dependency")
+
+    gmsf_fig, gmsf_ax = plt.subplots(figsize=(5.3, 3.8))
+    bottoms = np.zeros(len(df))
+    for label, column, color in series:
+        values = df[column].to_numpy(dtype=float)
+        gmsf_ax.bar(x, values, bottom=bottoms, color=color, width=0.62, label=label)
+        bottoms += np.nan_to_num(values)
+    gmsf_ax.set_xticks(x)
+    gmsf_ax.set_xticklabels(df["period"], rotation=25, ha="right")
+    gmsf_ax.set_ylim(0, 1)
+    gmsf_ax.set_ylabel("Mean GMSF weight")
+    gmsf_ax.set_title("Component fusion weights")
+    gmsf_ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.25), ncol=3)
+    gmsf_fig.tight_layout()
+    save_figure(gmsf_fig, out_dir, "gate_gmsf_component_weights")
 
 
 def plot_similarity_heatmaps(adj, pre_tokens, post_tokens, out_dir):
@@ -515,20 +596,22 @@ def plot_similarity_heatmaps(adj, pre_tokens, post_tokens, out_dir):
     )
 
     mats = [
-        ("Static adjacency", adj, "viridis", None, None),
-        ("Before GPT/PFA", pre_sim, "coolwarm", -1, 1),
-        ("After GPT/PFA", post_sim, "coolwarm", -1, 1),
-        ("After - before", delta, "coolwarm", -0.4, 0.4),
+        ("adjacency", "Static adjacency", adj, "viridis", None, None),
+        ("pre_gpt_similarity", "Before GPT/PFA", pre_sim, "coolwarm", -1, 1),
+        ("post_gpt_similarity", "After GPT/PFA", post_sim, "coolwarm", -1, 1),
+        ("delta_similarity", "After - before", delta, "coolwarm", -0.4, 0.4),
     ]
-    fig, axes = plt.subplots(1, 4, figsize=(11.0, 2.8), constrained_layout=True)
-    for ax, (title, mat, cmap, vmin, vmax) in zip(axes, mats):
+    for stem, title, mat, cmap, vmin, vmax in mats:
+        fig, ax = plt.subplots(figsize=(4.4, 4.0), dpi=600)
         im = ax.imshow(mat, cmap=cmap, vmin=vmin, vmax=vmax, aspect="equal")
         ax.set_title(title)
         ax.set_xlabel("Node")
         ax.set_ylabel("Node")
-        ax.tick_params(labelsize=6)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    save_figure(fig, out_dir, "gpt_node_similarity_heatmaps")
+        ax.tick_params(labelsize=8.5)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(labelsize=8.5)
+        plt.tight_layout()
+        save_figure(fig, out_dir, stem, formats=["png"])
 
 
 def parse_args():
