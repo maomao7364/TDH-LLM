@@ -35,6 +35,7 @@ METHOD_STYLE = {
     'ST-LLM': dict(color='#72B7B2', lw=1.45, alpha=0.09, marker='s'),
     'LTFP-STSR': dict(color='#C27C3A', lw=1.45, alpha=0.09, marker='^'),
 }
+METHOD_LABELS = {'DeST-LLM': 'TDH-LLM'}
 
 
 def parse_int_list(value):
@@ -206,7 +207,7 @@ def plot_one_radar(metrics, metric_name, horizon, out_dir, formats):
             markeredgewidth=0.65,
             markeredgecolor='white',
             markerfacecolor=style['color'],
-            label=method,
+            label=METHOD_LABELS.get(method, method),
             zorder=3,
         )
         ax.fill(

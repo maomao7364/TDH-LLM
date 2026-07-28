@@ -7,10 +7,12 @@ captures selected intermediate tensors, and writes paper-oriented figures to
 import argparse
 import os
 import types
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 import pandas as pd
 
@@ -34,6 +36,12 @@ PALETTE = {
     "gate_periodic": "#7EA6B8",
     "gate_residual": "#D2A66A",
 }
+HORIZON_COLORS = ["#80BEB3", "#72B0DE", "#EAB16E", "#E97A6F"]
+GMSF_SERIES = [
+    ("Trend", "trend_weight", "#80BEB3", "o"),
+    ("Local Temporal Variation", "periodic_weight", "#72B0DE", "s"),
+    ("Residual", "residual_weight", "#EAB16E", "D"),
+]
 TIME_PERIODS = ["Night", "Morning peak", "Off-peak", "Evening peak"]
 
 
@@ -50,11 +58,25 @@ def residual_summary(y_true, y_pred, mask_value=0.0):
     valid = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true > mask_value)
     residual = (y_pred - y_true)[valid]
     if residual.size == 0:
-        return {"count": 0, "mean": np.nan, "std": np.nan}
+        return {
+            "count": 0,
+            "mean": np.nan,
+            "std": np.nan,
+            "median": np.nan,
+            "q25": np.nan,
+            "q75": np.nan,
+            "mae": np.nan,
+            "rmse": np.nan,
+        }
     return {
         "count": int(residual.size),
         "mean": float(np.mean(residual)),
         "std": float(np.std(residual)),
+        "median": float(np.median(residual)),
+        "q25": float(np.percentile(residual, 25)),
+        "q75": float(np.percentile(residual, 75)),
+        "mae": float(np.mean(np.abs(residual))),
+        "rmse": float(np.sqrt(np.mean(residual * residual))),
     }
 
 
@@ -374,74 +396,173 @@ def sample_residual_for_plot(residual, max_points=200000):
     return residual
 
 
-def draw_residual_distribution(ax, residual, summary, minutes):
-    residual = sample_residual_for_plot(residual)
-    ax.hist(
-        residual,
-        bins=70,
-        density=True,
-        color=PALETTE["residual_hist"],
-        alpha=0.66,
-        edgecolor="white",
-        linewidth=0.3,
-    )
-    x_grid, density = kde_curve(residual)
-    if x_grid.size:
-        ax.plot(x_grid, density, color=PALETTE["residual_kde"], lw=1.55)
-    ax.axvline(0, color=PALETTE["red"], lw=1.0, ls="--")
-    ax.axvline(summary["mean"], color=PALETTE["residual_mean"], lw=1.0)
-    ax.text(
-        0.03,
-        0.94,
-        f"\u03bc={summary['mean']:.2f}\n\u03c3={summary['std']:.2f}",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=11,
-        bbox=dict(facecolor="white", edgecolor="none", alpha=0.70, pad=1.8),
-    )
-    ax.set_title(f"{minutes} min residual")
-    ax.set_xlabel("Prediction residual")
-    ax.set_ylabel("Density")
-
-
-def plot_residual_distributions(y_true, y_pred, out_dir):
+def collect_residual_items(y_true, y_pred):
     horizon_indices = key_horizon_indices(y_true.shape[-1])
     if not horizon_indices:
         horizon_indices = [y_true.shape[-1] - 1]
-    fig, axes = plt.subplots(2, 2, figsize=(8.8, 6.8), squeeze=False)
-    summaries = []
     residual_items = []
-    for ax, h_idx in zip(axes.ravel(), horizon_indices):
+    for h_idx in horizon_indices:
         valid = y_true[:, :, h_idx] > 0
         residual = (y_pred[:, :, h_idx] - y_true[:, :, h_idx])[valid]
         summary = residual_summary(y_true[:, :, h_idx], y_pred[:, :, h_idx])
         minutes = (h_idx + 1) * 5
-        summaries.append({
-            "horizon": h_idx + 1,
-            "minutes": minutes,
-            **summary,
-        })
-        residual_items.append((h_idx, minutes, residual, summary))
-        draw_residual_distribution(ax, residual, summary, minutes)
-    for ax in axes.ravel()[len(horizon_indices):]:
-        ax.axis("off")
-    fig.tight_layout()
-    save_figure(fig, out_dir, "residual_distribution_by_horizon")
-
-    for h_idx, minutes, residual, summary in residual_items:
-        single_fig, single_ax = plt.subplots(figsize=(4.6, 3.8))
-        draw_residual_distribution(single_ax, residual, summary, minutes)
-        single_fig.tight_layout()
-        save_figure(
-            single_fig,
-            out_dir,
-            f"residual_distribution_{minutes}min",
+        residual_items.append(
+            {
+                "horizon": h_idx + 1,
+                "minutes": minutes,
+                "residual": residual,
+                "summary": summary,
+            }
         )
+    return residual_items
+
+
+def residual_violin_display_limit(residual_items):
+    """Return a symmetric limit covering the pooled central 95% residuals."""
+    pooled = np.concatenate(
+        [sample_residual_for_plot(item["residual"], max_points=50000)
+         for item in residual_items]
+    )
+    low, high = np.percentile(pooled, [2.5, 97.5])
+    limit = max(abs(float(low)), abs(float(high)))
+    return max(10.0, float(np.ceil(limit / 5.0) * 5.0))
+
+
+def residual_statistics_label(summary):
+    """Format compact residual statistics using matplotlib mathtext symbols."""
+    return (
+        rf"$\mu$={summary['mean']:.2f}   "
+        rf"$\sigma$={summary['std']:.2f}   "
+        f"MAE={summary['mae']:.2f}   "
+        f"RMSE={summary['rmse']:.2f}"
+    )
+
+
+def plot_residual_distributions(y_true, y_pred, out_dir):
+    residual_items = collect_residual_items(y_true, y_pred)
+    summaries = [
+        {
+            "horizon": item["horizon"],
+            "minutes": item["minutes"],
+            **item["summary"],
+        }
+        for item in residual_items
+    ]
+    display_limit = residual_violin_display_limit(residual_items)
+    positions = np.arange(len(residual_items), dtype=float) * 1.35
+    violin_values = []
+    for item in residual_items:
+        values = sample_residual_for_plot(item["residual"], max_points=50000)
+        values = values[np.isfinite(values)]
+        violin_values.append(
+            values[(values >= -display_limit) & (values <= display_limit)]
+        )
+
+    fig, ax = plt.subplots(figsize=(9.4, 5.2), facecolor="white")
+    violin = ax.violinplot(
+        violin_values,
+        positions=positions,
+        orientation="horizontal",
+        widths=0.66,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+        points=300,
+    )
+    for body, color in zip(violin["bodies"], HORIZON_COLORS):
+        body.set_facecolor(color)
+        body.set_edgecolor("#56616D")
+        body.set_linewidth(0.8)
+        body.set_alpha(0.84)
+
+    for item_idx, (position, item) in enumerate(zip(positions, residual_items)):
+        values = item["residual"]
+        lower_90, upper_90 = np.percentile(values, [5, 95])
+        summary = item["summary"]
+        ax.hlines(
+            position,
+            lower_90,
+            upper_90,
+            color="#475569",
+            linewidth=1.15,
+            label="90% interval" if item_idx == 0 else "_nolegend_",
+            zorder=4,
+        )
+        ax.hlines(
+            position,
+            summary["q25"],
+            summary["q75"],
+            color="#263548",
+            linewidth=4.0,
+            label="IQR" if item_idx == 0 else "_nolegend_",
+            zorder=5,
+        )
+        ax.scatter(
+            summary["median"],
+            position,
+            s=38,
+            facecolor="white",
+            edgecolor="#263548",
+            linewidth=0.9,
+            label="Median" if item_idx == 0 else "_nolegend_",
+            zorder=6,
+        )
+        ax.text(
+            display_limit * 0.97,
+            position + 0.47,
+            residual_statistics_label(summary),
+            ha="right",
+            va="center",
+            color="#475569",
+            fontsize=10.5,
+        )
+
+    ax.axvline(
+        0,
+        color="#334155",
+        linewidth=0.9,
+        linestyle=(0, (3, 2)),
+        label="Zero residual",
+        zorder=2,
+    )
+    ax.set_xlim(-display_limit, display_limit)
+    ax.set_ylim(-0.55, positions[-1] + 0.75)
+    ax.invert_yaxis()
+    ax.set_yticks(positions)
+    ax.set_yticklabels([f"{item['minutes']} min" for item in residual_items])
+    ax.set_xlabel("Prediction residual (central 95% shown)")
+    ax.set_ylabel("Prediction horizon")
+    ax.grid(axis="x", color="#D8DEE3", linestyle="--", linewidth=0.65, alpha=0.55)
+    ax.grid(axis="y", visible=False)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("#111827")
+        spine.set_linewidth(0.8)
+    ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.015, 0.53),
+        ncol=1,
+        frameon=False,
+        handlelength=2.0,
+        handletextpad=0.45,
+        labelspacing=1.0,
+        fontsize=10.5,
+    )
 
     pd.DataFrame(summaries).to_csv(
         os.path.join(out_dir, "residual_distribution_summary.csv"), index=False
     )
+    for previous_stem in (
+        "residual_density_across_horizons",
+        "residual_quantile_fan_across_horizons",
+    ):
+        for suffix in ("png", "svg", "pdf"):
+            previous_path = Path(out_dir) / f"{previous_stem}.{suffix}"
+            if previous_path.exists():
+                previous_path.unlink()
+    fig.suptitle("Residual distribution at different horizons", y=0.975)
+    fig.subplots_adjust(left=0.10, right=0.80, top=0.88, bottom=0.13)
+    save_figure(fig, out_dir, "residual_violin_by_horizon", formats=["png"])
 
 
 def plot_mtd_example(example, out_dir):
@@ -457,7 +578,11 @@ def plot_mtd_example(example, out_dir):
     )
     axes[1].plot(steps, minmax(example["trend"]), color=PALETTE["green"], lw=1.4, label="Trend")
     axes[1].plot(
-        steps, minmax(example["periodic"]), color=PALETTE["blue"], lw=1.4, label="Periodic"
+        steps,
+        minmax(example["periodic"]),
+        color=PALETTE["blue"],
+        lw=1.4,
+        label="Local Temporal Variation",
     )
     axes[1].plot(
         steps, minmax(example["residual"]), color=PALETTE["orange"], lw=1.4, label="Residual"
@@ -480,7 +605,11 @@ def plot_mtd_example(example, out_dir):
     comp_fig, comp_ax = plt.subplots(figsize=(5.2, 3.5))
     comp_ax.plot(steps, minmax(example["trend"]), color=PALETTE["gate_trend"], lw=1.5, label="Trend")
     comp_ax.plot(
-        steps, minmax(example["periodic"]), color=PALETTE["gate_periodic"], lw=1.5, label="Periodic"
+        steps,
+        minmax(example["periodic"]),
+        color=PALETTE["gate_periodic"],
+        lw=1.5,
+        label="Local Temporal Variation",
     )
     comp_ax.plot(
         steps, minmax(example["residual"]), color=PALETTE["gate_residual"], lw=1.5, label="Residual"
@@ -516,67 +645,123 @@ def aggregate_gates_by_period(tod, ref_dependency, gmsf_weights):
     return pd.DataFrame(rows)
 
 
+def plot_gmsf_component_weights(df, out_dir):
+    required = {
+        "period",
+        "trend_weight",
+        "periodic_weight",
+        "residual_weight",
+    }
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"Missing GMSF columns: {sorted(missing)}")
+
+    ordered = (
+        df.set_index("period")
+        .reindex([period for period in TIME_PERIODS if period in set(df["period"])])
+        .reset_index()
+    )
+    component_labels = [item[0] for item in GMSF_SERIES]
+    component_columns = [item[1] for item in GMSF_SERIES]
+    matrix = ordered[component_columns].to_numpy(dtype=float).T
+    cmap = LinearSegmentedColormap.from_list(
+        "gmsf_weight",
+        ["#F7FAFC", "#DCEAE8", "#A8D0CA", "#76AAA9", "#3F6E9F"],
+    )
+
+    fig, ax = plt.subplots(figsize=(8.8, 3.7), facecolor="white")
+    image = ax.imshow(
+        matrix,
+        cmap=cmap,
+        vmin=0.0,
+        vmax=0.50,
+        aspect="auto",
+        interpolation="nearest",
+    )
+    ax.set_xticks(np.arange(len(ordered)))
+    ax.set_xticklabels(ordered["period"])
+    ax.set_yticks(np.arange(len(component_labels)))
+    ax.set_yticklabels(component_labels)
+    ax.set_xlabel("Traffic period")
+    ax.set_ylabel("GMSF component")
+    ax.set_title("Adaptive GMSF fusion weights across traffic periods", pad=12)
+
+    ax.set_xticks(np.arange(-0.5, len(ordered), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(component_labels), 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=1.4)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("#CBD5E1")
+        spine.set_linewidth(0.8)
+
+    for row in range(matrix.shape[0]):
+        for column in range(matrix.shape[1]):
+            value = matrix[row, column]
+            text_color = "white" if value >= 0.34 else "#243447"
+            ax.text(
+                column,
+                row,
+                f"{value:.3f}",
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=10.5,
+            )
+
+    colorbar = fig.colorbar(
+        image,
+        ax=ax,
+        fraction=0.035,
+        pad=0.035,
+        ticks=np.arange(0.0, 0.51, 0.10),
+    )
+    colorbar.set_label("Mean fusion weight", rotation=90, labelpad=10)
+    colorbar.outline.set_edgecolor("#CBD5E1")
+    colorbar.outline.set_linewidth(0.8)
+
+    fig.subplots_adjust(left=0.25, right=0.91, top=0.82, bottom=0.20)
+    save_figure(
+        fig,
+        out_dir,
+        "gmsf_component_weights_by_period",
+        formats=["png"],
+    )
+
+
 def plot_gate_analysis(tod, ref_dependency, gmsf_weights, out_dir):
     if tod is None or (ref_dependency is None and gmsf_weights is None):
         print("Gate tensors unavailable; skipped gate analysis.")
         return
     df = aggregate_gates_by_period(tod, ref_dependency, gmsf_weights)
     df.to_csv(os.path.join(out_dir, "gate_weights_by_time_period.csv"), index=False)
+    plot_gmsf_component_weights(df, out_dir)
 
-    fig, axes = plt.subplots(1, 2, figsize=(8.8, 3.8))
-    x = np.arange(len(df))
-    if "reference_dependency" in df:
-        axes[0].bar(x, df["reference_dependency"], color=PALETTE["gate_reference"], width=0.68)
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(df["period"], rotation=25, ha="right")
-    axes[0].set_ylim(0, 1)
-    axes[0].set_ylabel("Mean 1 - gate")
-    axes[0].set_title("Periodic reference dependency")
 
-    bottoms = np.zeros(len(df))
-    series = [
-        ("Trend", "trend_weight", PALETTE["gate_trend"]),
-        ("Periodic", "periodic_weight", PALETTE["gate_periodic"]),
-        ("Residual", "residual_weight", PALETTE["gate_residual"]),
-    ]
-    for label, column, color in series:
-        values = df[column].to_numpy(dtype=float)
-        axes[1].bar(x, values, bottom=bottoms, color=color, width=0.68, label=label)
-        bottoms += np.nan_to_num(values)
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(df["period"], rotation=25, ha="right")
-    axes[1].set_ylim(0, 1)
-    axes[1].set_ylabel("Mean GMSF weight")
-    axes[1].set_title("Component fusion weights")
-    axes[1].legend(loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=3)
-    fig.tight_layout()
-    save_figure(fig, out_dir, "gate_weights_by_time_period")
+def redraw_saved_figures(source_dir, out_dir):
+    source_dir = Path(source_dir)
+    out_dir = Path(out_dir)
+    prediction_path = source_dir / "interpretability_predictions.npz"
+    gate_path = source_dir / "gate_weights_by_time_period.csv"
+    if not prediction_path.exists():
+        raise FileNotFoundError(f"Missing saved predictions: {prediction_path}")
+    if not gate_path.exists():
+        raise FileNotFoundError(f"Missing saved gate statistics: {gate_path}")
 
-    ref_fig, ref_ax = plt.subplots(figsize=(5.0, 3.8))
-    if "reference_dependency" in df:
-        ref_ax.bar(x, df["reference_dependency"], color=PALETTE["gate_reference"], width=0.62)
-    ref_ax.set_xticks(x)
-    ref_ax.set_xticklabels(df["period"], rotation=25, ha="right")
-    ref_ax.set_ylim(0, 1)
-    ref_ax.set_ylabel("Mean 1 - gate")
-    ref_ax.set_title("Periodic reference dependency")
-    ref_fig.tight_layout()
-    save_figure(ref_fig, out_dir, "gate_reference_dependency")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    set_plot_style()
+    with np.load(prediction_path, allow_pickle=False) as saved:
+        if not {"y_true", "y_pred"}.issubset(saved.files):
+            raise ValueError(
+                f"{prediction_path} must contain y_true and y_pred; found {saved.files}"
+            )
+        y_true = saved["y_true"]
+        y_pred = saved["y_pred"]
+    plot_residual_distributions(y_true, y_pred, out_dir)
 
-    gmsf_fig, gmsf_ax = plt.subplots(figsize=(5.3, 3.8))
-    bottoms = np.zeros(len(df))
-    for label, column, color in series:
-        values = df[column].to_numpy(dtype=float)
-        gmsf_ax.bar(x, values, bottom=bottoms, color=color, width=0.62, label=label)
-        bottoms += np.nan_to_num(values)
-    gmsf_ax.set_xticks(x)
-    gmsf_ax.set_xticklabels(df["period"], rotation=25, ha="right")
-    gmsf_ax.set_ylim(0, 1)
-    gmsf_ax.set_ylabel("Mean GMSF weight")
-    gmsf_ax.set_title("Component fusion weights")
-    gmsf_ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.25), ncol=3)
-    gmsf_fig.tight_layout()
-    save_figure(gmsf_fig, out_dir, "gate_gmsf_component_weights")
+    gate_df = pd.read_csv(gate_path)
+    gate_df.to_csv(out_dir / "gate_weights_by_time_period.csv", index=False)
+    plot_gmsf_component_weights(gate_df, out_dir)
 
 
 def plot_similarity_heatmaps(adj, pre_tokens, post_tokens, out_dir):
@@ -616,9 +801,17 @@ def plot_similarity_heatmaps(adj, pre_tokens, post_tokens, out_dir):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate DeST-LLM interpretability figures.")
-    parser.add_argument("--checkpoint", required=True, help="Path to best_model.pth")
+    parser.add_argument("--checkpoint", default=None, help="Path to best_model.pth")
     parser.add_argument("--config", default=None, help="Path to model_args.json; auto-detected")
     parser.add_argument("--out_dir", default=None, help="Output directory")
+    parser.add_argument(
+        "--redraw_from",
+        default=None,
+        help=(
+            "Redraw residual and GMSF figures from a directory containing "
+            "interpretability_predictions.npz and gate_weights_by_time_period.csv."
+        ),
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--data", default=None)
     parser.add_argument("--adj", default=None)
@@ -655,6 +848,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.redraw_from:
+        out_dir = args.out_dir or os.path.join(
+            ROOT_DIR, "figures", "interpretability_refined"
+        )
+        redraw_saved_figures(args.redraw_from, out_dir)
+        print(f"Refined interpretability figures saved to: {out_dir}")
+        return
+    if not args.checkpoint:
+        raise ValueError("--checkpoint is required unless --redraw_from is provided.")
+
     from visualize_forecast import load_config, resolve_gpt2_path
 
     cfg, ckpt_dir = load_config(args.checkpoint, args.config)

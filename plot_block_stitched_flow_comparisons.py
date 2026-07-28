@@ -11,10 +11,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 
 from plot_flow_sequence_comparison import (
-    CONTINUOUS_STYLE,
     OUT_DIR,
     PREDICTION_FILES,
     RAW_START_TIME,
@@ -22,19 +22,56 @@ from plot_flow_sequence_comparison import (
     align_last,
     load_prediction_npz,
     load_test_time_features,
-    set_plot_style,
     target_tod_index,
     test_raw_start_index,
 )
+from plot_selected_abrupt_event_figures import set_plot_style
 
 
-BLOCK_DIR = OUT_DIR / 'all_nodes_72h_block_stitch'
+BLOCK_DIR = OUT_DIR / 'all_nodes_72h_block_stitch_nature_style'
 METRIC_FILE = OUT_DIR / 'node_selection_metrics.csv'
 METHODS = ('DeST-LLM', 'ST-LLM', 'LTFP-STSR')
+LEGEND_ORDER = ('Ground Truth', 'DeST-LLM', 'ST-LLM', 'LTFP-STSR')
+LEGEND_LABELS = {'DeST-LLM': 'TDH-LLM'}
 INPUT_LEN = 24
 OUTPUT_LEN = 24
 NUM_BLOCKS = 36
 POINTS_72H = OUTPUT_LEN * NUM_BLOCKS
+
+PLOT_STYLE = {
+    'Ground Truth': {
+        'color': '#566573',
+        'linewidth': 1.0,
+        'marker': 'o',
+        'markersize': 4.2,
+        'alpha': 0.82,
+        'zorder': 2,
+    },
+    'DeST-LLM': {
+        'color': '#2F75B5',
+        'linewidth': 1.0,
+        'marker': 's',
+        'markersize': 4.5,
+        'alpha': 1.0,
+        'zorder': 5,
+    },
+    'ST-LLM': {
+        'color': '#D8665B',
+        'linewidth': 1.0,
+        'marker': '^',
+        'markersize': 4.0,
+        'alpha': 0.90,
+        'zorder': 4,
+    },
+    'LTFP-STSR': {
+        'color': '#7A68A6',
+        'linewidth': 1.0,
+        'marker': 'D',
+        'markersize': 4.0,
+        'alpha': 0.90,
+        'zorder': 3,
+    },
+}
 
 
 def load_metric_rows(path):
@@ -138,58 +175,100 @@ def add_block_boundaries(ax, timestamps):
         ax.axvline(timestamps[idx], color='#D6D6D6', lw=0.45, alpha=0.45, zorder=0)
 
 
+def style_boxed_axis(ax):
+    ax.grid(
+        axis='both',
+        color='#D8DEE3',
+        linestyle='--',
+        linewidth=0.65,
+        alpha=0.62,
+    )
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color('#2F3337')
+        spine.set_linewidth(0.9)
+    ax.tick_params(direction='out', length=3.5, width=0.8, colors='#333333')
+
+
+def line_kwargs(method, linewidth=None):
+    style = PLOT_STYLE[method]
+    return {
+        'color': style['color'],
+        'linestyle': '-',
+        'lw': style['linewidth'] if linewidth is None else linewidth,
+        'alpha': style['alpha'],
+        'zorder': style['zorder'],
+    }
+
+
+def shared_legend_handles():
+    return [
+        Line2D(
+            [0],
+            [0],
+            color=PLOT_STYLE[method]['color'],
+            linestyle='-',
+            linewidth=PLOT_STYLE[method]['linewidth'],
+            marker=PLOT_STYLE[method]['marker'],
+            markersize=PLOT_STYLE[method]['markersize'],
+            markerfacecolor='white',
+            markeredgecolor=PLOT_STYLE[method]['color'],
+            markeredgewidth=0.9,
+            label=LEGEND_LABELS.get(method, method),
+        )
+        for method in LEGEND_ORDER
+    ]
+
+
 def plot_node(node, series, out_dir, metric_row):
     dest_mae, st_mae, ltfp_mae, best_name, gain, gain_pct = gain_against_best_baseline(series)
     timestamps = series['timestamps']
     truth = series['truth']
 
-    fig, axes = plt.subplots(
-        2,
-        1,
-        figsize=(12.0, 5.8),
-        sharex=True,
-        gridspec_kw={'height_ratios': [3.0, 1.05], 'hspace': 0.08},
-        facecolor='white',
-    )
-    ax, err_ax = axes
+    fig, ax = plt.subplots(figsize=(12.0, 4.8), facecolor='white')
 
-    ax.plot(timestamps, truth, label='Ground Truth', **CONTINUOUS_STYLE['Ground Truth'])
+    ax.plot(timestamps, truth, label='Ground Truth', **line_kwargs('Ground Truth'))
     for method in METHODS:
         pred = series['preds'][method]
-        ax.plot(timestamps, pred, label=method, **CONTINUOUS_STYLE[method])
-        err_ax.plot(
+        ax.plot(
             timestamps,
-            np.abs(pred - truth),
-            label=method,
-            color=CONTINUOUS_STYLE[method]['color'],
-            linestyle=CONTINUOUS_STYLE[method]['linestyle'],
-            lw=1.25,
-            alpha=0.95,
+            pred,
+            label=LEGEND_LABELS.get(method, method),
+            **line_kwargs(method),
         )
 
-    for panel in axes:
-        add_block_boundaries(panel, timestamps)
-        panel.grid(True, linestyle='--', linewidth=0.6, alpha=0.38)
+    add_block_boundaries(ax, timestamps)
+    style_boxed_axis(ax)
 
-    ax.set_title(node_title(node, metric_row, gain, gain_pct, dest_mae), pad=12, fontsize=13)
+    fig.suptitle(
+        node_title(node, metric_row, gain, gain_pct, dest_mae),
+        y=0.985,
+        fontsize=13,
+    )
     ax.set_ylabel('Traffic flow')
-    ax.legend(
-        loc='center left',
-        bbox_to_anchor=(1.01, 0.5),
-        ncol=1,
-        fontsize=10,
-        edgecolor='#444444',
-        handlelength=2.5,
+    ax.set_xlabel('Date and time')
+    ax.set_xlim(timestamps[0], timestamps[-1])
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=12))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d\n%H:%M'))
+    fig.legend(
+        handles=shared_legend_handles(),
+        labels=[LEGEND_LABELS.get(method, method) for method in LEGEND_ORDER],
+        loc='lower center',
+        bbox_to_anchor=(0.5, 0.79),
+        ncol=4,
+        frameon=True,
+        fancybox=False,
+        framealpha=0.96,
+        facecolor='#F4F7F8',
+        edgecolor='#D1D9DE',
+        borderpad=0.55,
+        columnspacing=1.55,
+        handlelength=2.7,
+        fontsize=13,
     )
 
-    err_ax.set_ylabel('Abs. error')
-    err_ax.set_xlabel('Timestamp')
-    err_ax.set_xlim(timestamps[0], timestamps[-1])
-    err_ax.xaxis.set_major_locator(mdates.HourLocator(interval=12))
-    err_ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d\n%H:%M'))
-
-    fig.subplots_adjust(left=0.08, right=0.84, top=0.90, bottom=0.13, hspace=0.10)
-    out_path = out_dir / f'node_{node:02d}_72h_block_stitched_flow_error_comparison.png'
+    fig.subplots_adjust(left=0.08, right=0.985, top=0.76, bottom=0.17)
+    out_path = out_dir / f'node_{node:02d}_72h_block_stitched_flow_comparison.png'
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
     return out_path, {
