@@ -488,15 +488,6 @@ def plot_residual_distributions(y_true, y_pred, out_dir):
             label="90% interval" if item_idx == 0 else "_nolegend_",
             zorder=4,
         )
-        ax.hlines(
-            position,
-            summary["q25"],
-            summary["q75"],
-            color="#263548",
-            linewidth=4.0,
-            label="IQR" if item_idx == 0 else "_nolegend_",
-            zorder=5,
-        )
         ax.scatter(
             summary["median"],
             position,
